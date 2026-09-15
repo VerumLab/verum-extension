@@ -733,6 +733,235 @@ function rootListPendingConsolidations(data: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
+// Gloas (Glamsterdam) — EIP-7495 ProgressiveContainer / EIP-7916 ProgressiveList
+// merkleization + EIP-7732 (ePBS) field set. Serialization is unchanged from the
+// prior forks (offsets parse the same); only hash_tree_root changes here.
+// ---------------------------------------------------------------------------
+
+// Fork activation by slot (epoch = slot / 32). Determined from the known update
+// epoch per chain, NOT from state-structure heuristics. Gloas is the only fork
+// whose BeaconState/BeaconBlockBody merkleization this file special-cases; the
+// pre-Gloas forks keep their existing serialization-driven detection. A chain not
+// listed (or with Gloas not yet scheduled → Infinity) is treated as pre-Gloas.
+const GLOAS_FORK_EPOCH: Record<number, number> = {
+  1:          Infinity,   // mainnet — not scheduled yet
+  11155111:   Infinity,   // sepolia
+  17000:      Infinity,   // holesky
+  560048:     Infinity,   // hoodi
+  7091047534: 1536,       // Platåberget Glamsterdam devnet
+}
+export function isGloasSlot(chainId: number, slot: number): boolean {
+  const e = GLOAS_FORK_EPOCH[chainId]
+  return e !== undefined && Math.floor(slot / 32) >= e
+}
+
+// merkleize_progressive(chunks, num_leaves=1): 0-terminated sequence of binary
+// subtrees with leaf counts 1, 4, 16, … (EIP-7916). Empty → zero.
+function merkleizeProgressive(chunks: Uint8Array[], numLeaves = 1): Uint8Array {
+  if (chunks.length === 0) return ZERO[0]
+  const depth = Math.round(Math.log2(numLeaves))          // numLeaves ∈ {1,4,16,…} = 2^even
+  const a = merkleizeAtDepth(chunks.slice(0, numLeaves), depth)
+  const b = merkleizeProgressive(chunks.slice(numLeaves), numLeaves * 4)
+  return h(a, b)
+}
+// pack_bits(active_fields) as one 32-byte chunk (≤256 bits).
+function activeFieldsChunk(width: number): Uint8Array {
+  const o = new Uint8Array(32)
+  for (let i = 0; i < width; i++) o[i >> 3] |= 1 << (i & 7)
+  return o
+}
+// hash_tree_root(ProgressiveContainer) = hash(merkleize_progressive(field_roots), pack_bits(active_fields))
+function progContainer(fieldRoots: Uint8Array[], width: number): Uint8Array {
+  return h(merkleizeProgressive(fieldRoots), activeFieldsChunk(width))
+}
+// hash_tree_root(ProgressiveList) = mix_in_length(merkleize_progressive(...), len)
+function progListComposite(data: Uint8Array, elemSize: number, rootFn: (b: Uint8Array) => Uint8Array): Uint8Array {
+  const n = Math.floor(data.length / elemSize)
+  const roots: Uint8Array[] = []
+  for (let i = 0; i < n; i++) roots.push(rootFn(data.slice(i * elemSize, (i + 1) * elemSize)))
+  return mixLen(merkleizeProgressive(roots), n)
+}
+function progListVariable(data: Uint8Array, rootFn: (b: Uint8Array) => Uint8Array): Uint8Array {
+  if (data.length === 0) return mixLen(ZERO[0], 0)
+  const roots = parseVariableList(data).map(rootFn)
+  return mixLen(merkleizeProgressive(roots), roots.length)
+}
+function progListU64(data: Uint8Array): Uint8Array { return mixLen(merkleizeProgressive(chunkify(data)), Math.floor(data.length / 8)) }
+function progListU8(data: Uint8Array): Uint8Array { return mixLen(merkleizeProgressive(chunkify(data)), data.length) }
+
+// -- Gloas element containers --
+// Withdrawal (44): index[8] validator_index[8] address[20] amount[8] → 4 leaves
+function rootWithdrawalG(b: Uint8Array): Uint8Array {
+  return merkleizeExact([u64chunk(b.slice(0, 8)), u64chunk(b.slice(8, 16)), pad32(b.slice(16, 36)), u64chunk(b.slice(36, 44))])
+}
+// Builder (93): pubkey[48] version[1] execution_address[20] balance[8] deposit_epoch[8] withdrawable_epoch[8] → 6 fields → 8 leaves
+function rootBuilderG(b: Uint8Array): Uint8Array {
+  return merkleizeExact([
+    rootBLSPubkey(b.slice(0, 48)), pad32(b.slice(48, 49)), pad32(b.slice(49, 69)),
+    u64chunk(b.slice(69, 77)), u64chunk(b.slice(77, 85)), u64chunk(b.slice(85, 93)), ZERO[0], ZERO[0],
+  ])
+}
+// BuilderPendingWithdrawal (36): fee_recipient[20] amount[8] builder_index[8] → 3 fields → 4 leaves
+function rootBuilderPendingWdG(b: Uint8Array): Uint8Array {
+  return merkleizeExact([pad32(b.slice(0, 20)), u64chunk(b.slice(20, 28)), u64chunk(b.slice(28, 36)), ZERO[0]])
+}
+// BuilderPendingPayment (52): weight[8] withdrawal[36] proposer_index[8] → 3 fields → 4 leaves
+function rootBuilderPendingPaymentG(b: Uint8Array): Uint8Array {
+  return merkleizeExact([u64chunk(b.slice(0, 8)), rootBuilderPendingWdG(b.slice(8, 44)), u64chunk(b.slice(44, 52)), ZERO[0]])
+}
+// ExecutionPayloadBid (ProgressiveContainer, width 12). Fixed prefix 188 bytes,
+// then blob_kzg_commitments offset[4] @188, execution_requests_root[32] @192.
+function rootExecutionPayloadBidG(b: Uint8Array): Uint8Array {
+  const blobOff = readU32LE(b, 188)
+  const blob = b.slice(blobOff)
+  const nComm = Math.floor(blob.length / 48)
+  const commRoots: Uint8Array[] = []
+  for (let i = 0; i < nComm; i++) commRoots.push(rootBLSPubkey(blob.slice(i * 48, i * 48 + 48))) // KZGCommitment = Bytes48
+  const blobRoot = mixLen(merkleizeProgressive(commRoots), nComm) // BlobKzgCommitments is a ProgressiveList in Gloas
+  return progContainer([
+    b.slice(0, 32), b.slice(32, 64), b.slice(64, 96), b.slice(96, 128),   // parent_block_hash, parent_block_root, block_hash, prev_randao
+    pad32(b.slice(128, 148)),                                              // fee_recipient
+    u64chunk(b.slice(148, 156)), u64chunk(b.slice(156, 164)), u64chunk(b.slice(164, 172)), // gas_limit, builder_index, slot
+    u64chunk(b.slice(172, 180)), u64chunk(b.slice(180, 188)),             // value, execution_payment
+    blobRoot, pad32(b.slice(192, 224)),                                   // blob_kzg_commitments, execution_requests_root
+  ], 12)
+}
+// PayloadAttestationData (42): beacon_block_root[32] slot[8] payload_present[1] blob_data_available[1] → 4 leaves
+function rootPayloadAttestationDataG(b: Uint8Array): Uint8Array {
+  return merkleizeExact([b.slice(0, 32), u64chunk(b.slice(32, 40)), pad32(b.slice(40, 41)), pad32(b.slice(41, 42))])
+}
+// PayloadAttestation (202, ProgressiveContainer width 3): aggregation_bits BitVector[512](64B) data(42) signature[96]
+function rootPayloadAttestationG(b: Uint8Array): Uint8Array {
+  return progContainer([h(b.slice(0, 32), b.slice(32, 64)), rootPayloadAttestationDataG(b.slice(64, 106)), rootBLSSignature(b.slice(106, 202))], 3)
+}
+// ProgressiveBitList (EIP-7916): strip sentinel bit, pack, mix_in_length(merkleize_progressive(chunks), bitCount)
+function rootProgressiveBitlist(data: Uint8Array): Uint8Array {
+  if (data.length === 0) return mixLen(ZERO[0], 0)
+  const lastByte = data[data.length - 1]
+  let sentinelBit = 0
+  for (let i = 7; i >= 0; i--) { if (lastByte & (1 << i)) { sentinelBit = i; break } }
+  const bitCount = (data.length - 1) * 8 + sentinelBit
+  const stripped = new Uint8Array(data)
+  stripped[stripped.length - 1] = lastByte ^ (1 << sentinelBit)
+  return mixLen(merkleizeProgressive(chunkify(stripped)), bitCount)
+}
+// Gloas Attestation (ProgressiveContainer width 4): aggregation_bits offset[4], data[128], signature[96], committee_bits[8]
+function rootAttestationGloas(b: Uint8Array): Uint8Array {
+  const offAgg = readU32LE(b, 0)
+  return progContainer([rootProgressiveBitlist(b.slice(offAgg)), rootAttestationData(b.slice(4, 132)), rootBLSSignature(b.slice(132, 228)), pad32(b.slice(228, 236))], 4)
+}
+// Gloas IndexedAttestation (ProgressiveContainer width 3): attesting_indices offset[4], data[128], signature[96]
+function rootIndexedAttestationGloas(b: Uint8Array): Uint8Array {
+  const offIdx = readU32LE(b, 0)
+  return progContainer([progListU64(b.slice(offIdx)), rootAttestationData(b.slice(4, 132)), rootBLSSignature(b.slice(132, 228))], 3)
+}
+// AttesterSlashing (regular container): attestation_1 offset[4], attestation_2 offset[4]
+function rootAttesterSlashingGloas(b: Uint8Array): Uint8Array {
+  const off1 = readU32LE(b, 0), off2 = readU32LE(b, 4)
+  return h(rootIndexedAttestationGloas(b.slice(off1, off2)), rootIndexedAttestationGloas(b.slice(off2)))
+}
+// BuilderDepositRequest (184): pubkey[48] withdrawal_credentials[32] amount[8] signature[96] → 4 fields → 4 leaves
+function rootBuilderDepositRequest(b: Uint8Array): Uint8Array {
+  return merkleizeExact([rootBLSPubkey(b.slice(0, 48)), b.slice(48, 80), u64chunk(b.slice(80, 88)), rootBLSSignature(b.slice(88, 184))])
+}
+// BuilderExitRequest (68): source_address[20] pubkey[48] → 2 fields
+function rootBuilderExitRequest(b: Uint8Array): Uint8Array {
+  return h(pad32(b.slice(0, 20)), rootBLSPubkey(b.slice(20, 68)))
+}
+// Gloas ExecutionRequests (ProgressiveContainer width 5): five ProgressiveLists, five offsets
+function rootExecutionRequestsGloas(b: Uint8Array): Uint8Array {
+  if (b.length === 0) return progContainer([mixLen(ZERO[0], 0), mixLen(ZERO[0], 0), mixLen(ZERO[0], 0), mixLen(ZERO[0], 0), mixLen(ZERO[0], 0)], 5)
+  const o = [readU32LE(b, 0), readU32LE(b, 4), readU32LE(b, 8), readU32LE(b, 12), readU32LE(b, 16), b.length]
+  return progContainer([
+    progListComposite(b.slice(o[0], o[1]), 192, rootDepositRequest),
+    progListComposite(b.slice(o[1], o[2]), 76, rootWithdrawalRequest),
+    progListComposite(b.slice(o[2], o[3]), 116, rootConsolidationRequest),
+    progListComposite(b.slice(o[3], o[4]), 184, rootBuilderDepositRequest),
+    progListComposite(b.slice(o[4], o[5]), 68, rootBuilderExitRequest),
+  ], 5)
+}
+
+// Full Gloas BeaconState hash_tree_root. Serialization order = 46 fields; fields
+// 11,12,15,16,21,34,35,36,38,42,44 are ProgressiveLists; the container itself is a
+// ProgressiveContainer (all 46 active). Reuses the pre-Gloas element roots where
+// the element type is unchanged.
+function computeBeaconStateRootGloas(stateSSZ: Uint8Array): BeaconStateVerification {
+  // Walk the fixed section: fixed fields are inline, variable fields are 4-byte offsets.
+  const fixed: (number | null)[] = [
+    8, 32, 8, 16, 112, 262144, 262144, null, 72, null, 8, null, null, 2097152, 65536, null, null,
+    1, 40, 40, 40, null, 24624, 24624, 32, 8, 8, null, 8, 8, 8, 8, 8, 8, null, null, null, 512,
+    null, 8, 1024, 3328, null, null, null, 393216,
+  ]
+  const slice: Uint8Array[] = new Array(46)
+  const varIdx: { i: number; off: number }[] = []
+  let cur = 0
+  for (let i = 0; i < 46; i++) {
+    if (fixed[i] === null) { varIdx.push({ i, off: readU32LE(stateSSZ, cur) }); cur += 4 }
+    else { slice[i] = stateSSZ.subarray(cur, cur + (fixed[i] as number)); cur += fixed[i] as number }
+  }
+  for (let k = 0; k < varIdx.length; k++) {
+    const start = varIdx[k].off
+    const end = k + 1 < varIdx.length ? varIdx[k + 1].off : stateSSZ.length
+    slice[varIdx[k].i] = stateSSZ.subarray(start, end)
+  }
+
+  const histSummaries = slice[27]
+  const fieldRoots: Uint8Array[] = [
+    u64chunk(slice[0]), pad32(slice[1]), u64chunk(slice[2]), rootFork(slice[3]),        // 0-3
+    rootBeaconBlockHeader(slice[4]), rootVectorRoot8192(slice[5]), rootVectorRoot8192(slice[6]), // 4-6
+    rootListRoot_2_24(slice[7]), rootEth1Data(slice[8]), rootListEth1Data(slice[9]), u64chunk(slice[10]), // 7-10
+    progListComposite(slice[11], 121, rootValidator),   // 11 validators
+    progListU64(slice[12]),                             // 12 balances
+    rootVectorBytes32_65536(slice[13]), rootVectorGwei8192(slice[14]),                  // 13-14
+    progListU8(slice[15]), progListU8(slice[16]),       // 15-16 participation
+    pad32(slice[17]), rootCheckpoint(slice[18]), rootCheckpoint(slice[19]), rootCheckpoint(slice[20]), // 17-20
+    progListU64(slice[21]),                             // 21 inactivity_scores
+    rootSyncCommittee(slice[22]), rootSyncCommittee(slice[23]),                         // 22-23
+    pad32(slice[24]), u64chunk(slice[25]), u64chunk(slice[26]),                         // 24 latest_block_hash, 25-26
+    rootListHistoricalSummary(slice[27]),               // 27 historical_summaries
+    u64chunk(slice[28]), u64chunk(slice[29]), u64chunk(slice[30]), u64chunk(slice[31]), // 28-31
+    u64chunk(slice[32]), u64chunk(slice[33]),           // 32-33
+    progListComposite(slice[34], 192, rootPendingDeposit),            // 34
+    progListComposite(slice[35], 24, rootPendingPartialWithdrawal),   // 35
+    progListComposite(slice[36], 16, rootPendingConsolidation),       // 36
+    merkleizeAtDepth(chunkify(slice[37]), 4),           // 37 proposer_lookahead Vector[u64,64]
+    progListComposite(slice[38], 93, rootBuilderG),     // 38 builders
+    u64chunk(slice[39]),                                // 39 next_withdrawal_builder_index
+    merkleizeAtDepth(chunkify(slice[40]), 5),           // 40 execution_payload_availability BitVector[8192]
+    (() => { const rs: Uint8Array[] = []; for (let i = 0; i < 64; i++) rs.push(rootBuilderPendingPaymentG(slice[41].subarray(i * 52, i * 52 + 52))); return merkleizeAtDepth(rs, 6) })(), // 41
+    progListComposite(slice[42], 36, rootBuilderPendingWdG),          // 42 builder_pending_withdrawals
+    rootExecutionPayloadBidG(slice[43]),                // 43 latest_execution_payload_bid
+    progListComposite(slice[44], 44, rootWithdrawalG),  // 44 payload_expected_withdrawals
+    (() => { const rs: Uint8Array[] = []; for (let i = 0; i < 96; i++) rs.push(merkleizeAtDepth(chunkify(slice[45].subarray(i * 4096, i * 4096 + 4096)), 7)); return merkleizeAtDepth(rs, 7) })(), // 45 ptc_window
+  ]
+  const computedRoot = hexlify(progContainer(fieldRoots, 46))
+
+  return {
+    computedRoot,
+    getBlockSummaryRoot(era: number): string | null {
+      const offset = era * 64
+      if (offset + 64 > histSummaries.length) return null
+      return hexlify(histSummaries.slice(offset, offset + 32))
+    },
+    getBlockRootAtSlot(slot: number): string {
+      const idx = slot % 8192
+      return hexlify(stateSSZ.slice(176 + idx * 32, 176 + (idx + 1) * 32))  // block_roots is field 5 @ byte 176 (unchanged)
+    },
+    getHistoricalSummariesBlob(): string {
+      let s = ''
+      for (let i = 0; i < histSummaries.length; i++) s += String.fromCharCode(histSummaries[i])
+      return btoa(s)
+    },
+    computeHistoricalSummariesFieldProof(): string {
+      // Progressive-container field proof not ported; the era-tail fast path is
+      // disabled for Gloas (full-state download is used instead), so this is unused.
+      throw new Error('historical_summaries field proof not supported for Gloas (use full-state path)')
+    },
+    getFieldRoots(): string[] { return fieldRoots.map(hexlify) },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main: full BeaconState hash_tree_root + historical_summaries extraction
 // ---------------------------------------------------------------------------
 
@@ -798,7 +1027,8 @@ export interface BeaconStateVerification {
  * Fixed prefix size: Capella/Deneb = 2736653, Electra/Fulu = 2736713.
  * Detection: the historical_roots offset stored at [524464,524468) equals the fixed prefix size.
  */
-export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerification {
+export function computeBeaconStateRoot(stateSSZ: Uint8Array, fork?: 'gloas'): BeaconStateVerification {
+  if (fork === 'gloas') return computeBeaconStateRootGloas(stateSSZ)
   if (stateSSZ.length < 2736653) throw new Error('BeaconState SSZ too short to parse')
 
   // historical_roots is the first variable field; its stored offset equals the total fixed-prefix size.
@@ -1044,7 +1274,47 @@ export interface BeaconBlockBodyVerification {
   executionBlockHash: string
 }
 
-export function computeBeaconBlockBodyRoot(bodySSZ: Uint8Array): BeaconBlockBodyVerification {
+// Gloas (ePBS) BeaconBlockBody — a ProgressiveContainer of 13 fields. The full
+// execution_payload is gone; execution_payload.block_hash moves into
+// signed_execution_payload_bid.message.block_hash. All list fields are ProgressiveLists.
+function computeBeaconBlockBodyRootGloas(bodySSZ: Uint8Array): BeaconBlockBodyVerification {
+  if (bodySSZ.length < 396) throw new Error('Gloas BeaconBlockBody SSZ too short')
+  const offPS  = readU32LE(bodySSZ, 200)
+  const offAS  = readU32LE(bodySSZ, 204)
+  const offAT  = readU32LE(bodySSZ, 208)
+  const offD   = readU32LE(bodySSZ, 212)
+  const offVE  = readU32LE(bodySSZ, 216)
+  const offBLS = readU32LE(bodySSZ, 380)
+  const offBid = readU32LE(bodySSZ, 384)
+  const offPA  = readU32LE(bodySSZ, 388)
+  const offER  = readU32LE(bodySSZ, 392)
+
+  const bid = bodySSZ.slice(offBid, offPA)      // SignedExecutionPayloadBid
+  const bidMsgOff = readU32LE(bid, 0)           // message offset; signature is bid[4,100)
+  const bidMsg = bid.slice(bidMsgOff)           // ExecutionPayloadBid
+  const executionBlockHash = hexlify(bidMsg.slice(64, 96))  // ExecutionPayloadBid.block_hash
+
+  const fieldRoots: Uint8Array[] = [
+    rootBLSSignature(bodySSZ.slice(0, 96)),                          // 0 randao_reveal
+    rootEth1Data(bodySSZ.slice(96, 168)),                           // 1 eth1_data
+    bodySSZ.slice(168, 200),                                        // 2 graffiti
+    progListComposite(bodySSZ.slice(offPS, offAS), 416,            // 3 proposer_slashings
+      b => h(rootSignedBeaconBlockHeader(b.slice(0, 208)), rootSignedBeaconBlockHeader(b.slice(208, 416)))),
+    progListVariable(bodySSZ.slice(offAS, offAT), rootAttesterSlashingGloas),  // 4 attester_slashings (Gloas)
+    progListVariable(bodySSZ.slice(offAT, offD), rootAttestationGloas),         // 5 attestations (Gloas)
+    progListComposite(bodySSZ.slice(offD, offVE), 1240, rootDeposit),          // 6 deposits
+    progListComposite(bodySSZ.slice(offVE, offBLS), 112, rootSignedVoluntaryExit),  // 7 voluntary_exits
+    rootSyncAggregate(bodySSZ.slice(220, 380)),                    // 8 sync_aggregate
+    progListComposite(bodySSZ.slice(offBLS, offBid), 172, rootSignedBLSToExecutionChange),  // 9 bls_to_execution_changes
+    h(rootExecutionPayloadBidG(bidMsg), rootBLSSignature(bid.slice(4, 100))),  // 10 signed_execution_payload_bid
+    progListComposite(bodySSZ.slice(offPA, offER), 202, rootPayloadAttestationG),  // 11 payload_attestations
+    rootExecutionRequestsGloas(bodySSZ.slice(offER)),              // 12 parent_execution_requests
+  ]
+  return { computedRoot: hexlify(progContainer(fieldRoots, 13)), executionBlockHash }
+}
+
+export function computeBeaconBlockBodyRoot(bodySSZ: Uint8Array, forkHint?: 'gloas'): BeaconBlockBodyVerification {
+  if (forkHint === 'gloas') return computeBeaconBlockBodyRootGloas(bodySSZ)
   if (bodySSZ.length < 384) throw new Error('BeaconBlockBody SSZ too short')
 
   const offPS = readU32LE(bodySSZ, 200)

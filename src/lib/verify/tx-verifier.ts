@@ -288,6 +288,8 @@ export interface RpcBlockFull {
   excessBlobGas?: string
   parentBeaconBlockRoot?: string
   requestsHash?: string
+  blockAccessListHash?: string   // EIP-7928 (Glamsterdam)
+  slotNumber?: string            // ePBS (Glamsterdam) — the consensus slot
   transactions: RpcTx[]
 }
 
@@ -306,6 +308,9 @@ function encodeBlockHeader(block: RpcBlockFull): Uint8Array {
   if (block.excessBlobGas !== undefined)         fields.push(h(block.excessBlobGas))
   if (block.parentBeaconBlockRoot !== undefined) fields.push(getBytes(block.parentBeaconBlockRoot))
   if (block.requestsHash !== undefined)         fields.push(getBytes(block.requestsHash))
+  // Glamsterdam trailing header fields, in order, appended only when present.
+  if (block.blockAccessListHash !== undefined)  fields.push(getBytes(block.blockAccessListHash))
+  if (block.slotNumber !== undefined)           fields.push(h(block.slotNumber))
   return getBytes(encodeRlp(fields as Parameters<typeof encodeRlp>[0]))
 }
 

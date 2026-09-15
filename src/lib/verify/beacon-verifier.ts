@@ -11,7 +11,8 @@ import { sha256, getBytes, hexlify } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
 import type { EraSource, StateSource, HistSource } from '../../types.js'
 import { computeBeaconBlockBodyRoot, computeBlindedBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof,
-  reconstructStateRootFromHistSummaries, computeSyncCommitteeRoot, hashNodes, computeExecutionPayloadHeaderRoot } from './ssz-state-verifier.js'
+  reconstructStateRootFromHistSummaries, computeSyncCommitteeRoot, hashNodes, computeExecutionPayloadHeaderRoot,
+  isGloasSlot } from './ssz-state-verifier.js'
 import { timestampToSlot, slotToTimestamp, sszMerkleize, readU32LE, fetchWithTimeout } from './beacon-primitives.js'
 import { getBlockSummaryRoot, fetchFixedSectionAtSlot } from './downloader/beacon-state.js'
 import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from './downloader/era-exec-headers.js'
@@ -150,15 +151,21 @@ export async function fetchVerifyBeaconBodyHash(
   rpc: string,
   slot: number,
   expectedBodyRoot: string,
+  chainId: number,
 ): Promise<string> {
+  // Gloas (ePBS) blinded bodies aren't ported; skip straight to the full-SSZ path
+  // for post-Gloas slots (the blinded path would fail closed and fall back anyway).
+  const gloas = isGloasSlot(chainId, slot)
   let blindedErr = ''
-  try {
-    return await fetchVerifyBlindedBody(rpc, slot, expectedBodyRoot)
-  } catch (e) {
-    blindedErr = (e as Error).message
+  if (!gloas) {
+    try {
+      return await fetchVerifyBlindedBody(rpc, slot, expectedBodyRoot)
+    } catch (e) {
+      blindedErr = (e as Error).message
+    }
   }
   try {
-    return await fetchVerifyFullBlockSSZ(rpc, slot, expectedBodyRoot)
+    return await fetchVerifyFullBlockSSZ(rpc, slot, expectedBodyRoot, gloas)
   } catch (e) {
     throw new Error(`blinded(${blindedErr}); ssz(${(e as Error).message})`)
   }
@@ -188,6 +195,7 @@ async function fetchVerifyFullBlockSSZ(
   rpc: string,
   slot: number,
   expectedBodyRoot: string,
+  gloas = false,
 ): Promise<string> {
   // AbortSignal.timeout() is broken in Chrome MV3 service workers; use fetchWithTimeout.
   const res = await fetchWithTimeout(
@@ -204,7 +212,7 @@ async function fetchVerifyFullBlockSSZ(
   const blockSSZ = blob.slice(readU32LE(blob, 0))
   if (blockSSZ.length < 84) throw new Error('BeaconBlock SSZ too short')
   const bodySSZ = blockSSZ.slice(readU32LE(blockSSZ, 80))
-  const { computedRoot, executionBlockHash } = computeBeaconBlockBodyRoot(bodySSZ)
+  const { computedRoot, executionBlockHash } = computeBeaconBlockBodyRoot(bodySSZ, gloas ? 'gloas' : undefined)
   if (computedRoot.toLowerCase() !== expectedBodyRoot.toLowerCase())
     throw new Error(`body root mismatch at slot ${slot}: ${computedRoot} ≠ ${expectedBodyRoot}`)
   return executionBlockHash
@@ -305,6 +313,11 @@ async function tryEraTailStateSummary(
     // reconstructs it. (The previous version used the anchor's OWN era for the blob — always
     // the current, still-unpublished one — so the era file 404'd on every call and this path
     // never actually fired outside a lucky moment.)
+    // Uses the CURRENT era's file, anchored at a recent (checkpoint-served, in-4788-ring)
+    // epoch boundary. During the current era's ~15-30 min publish dead zone the file 404s
+    // and we fall back to the full-state download. (A previous-era fallback isn't viable:
+    // era E-1's tail state is >1 epoch old and served by neither checkpoint nor consensus
+    // providers, so it can't be anchored.)
     const era = Math.floor(anchorSlot / 8192)
     const blob = await fetchHistoricalSummariesFromEraFile(era, chainId, eraFileUrls)
     if (!blob) {
@@ -544,7 +557,9 @@ export async function verifyViaBeacon(
     // instead of the full ~136 MB / 60 s-hash state download. Fails closed → full download.
     // Dev mode: histSource='full-state' skips era-tail; 'era-tail' forces it and does NOT
     // fall back (so a failure is visible instead of masked by the full download).
-    const wantEraTail = options?.histSource !== 'full-state'
+    // Gloas: the era-tail reconstruction uses the pre-Gloas (binary) field tree, so it
+    // can't rebuild a progressive-container state root — skip it and use the full-state path.
+    const wantEraTail = options?.histSource !== 'full-state' && !isGloasSlot(chainId, anchor.slot)
     const [eraTail, primaryRange] = await Promise.all([
       wantEraTail ? tryEraTailStateSummary(consensusRpcs, chainId, anchor.slot, options?.checkpointUrls, options?.eraFileUrls) : Promise.resolve(null),
       findEraBlockRange(execRpcs, primary.era * 8192, chainId),
@@ -732,7 +747,7 @@ export async function verifyViaBeacon(
     let executionHash: string | undefined
     for (const rpc of consensusRpcs) {
       try {
-        executionHash = await fetchVerifyBeaconBodyHash(rpc, s.slot, verifiedBodyRoot)
+        executionHash = await fetchVerifyBeaconBodyHash(rpc, s.slot, verifiedBodyRoot, chainId)
         break
       } catch (err) {
         console.warn(`[w3] Body verification failed (${rpc}):`, (err as Error).message)

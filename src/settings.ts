@@ -25,11 +25,11 @@ heliosReadsSwitch.addEventListener('change', () => {
   chrome.storage.session.set({ trustedReads: !heliosReadsSwitch.checked })
 })
 
-// The FAQ is deployed as calldata under verum.gwei. Open it through the renderer
+// The FAQ is deployed as calldata under extension.verum.gwei. Open it through the renderer
 // so it goes through the normal verified w3:// path, not an HTTP mirror.
 document.getElementById('faq-link')!.addEventListener('click', (e) => {
   e.preventDefault()
-  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://verum.gwei' })
+  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://extension.verum.gwei' })
 })
 
 async function updateCacheInfo() {

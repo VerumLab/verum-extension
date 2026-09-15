@@ -298,23 +298,37 @@ async function tryEraUrl(
 // fixing the alignment without needing the total uncompressed length.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Snappy framed decompress starting at an arbitrary in-stream frame boundary `start`.
-function snappyFramedFrom(data: Uint8Array, start: number, need: number): Uint8Array {
-  const out = new Uint8Array(need)
-  let pos = 0, s = start
-  while (s + 4 <= data.length && pos < need) {
+// Decompress every snappy frame from `start`, but retain only the LAST `keep` bytes of
+// output in a rolling buffer. Memory is bounded to `keep` regardless of how large the
+// stream decompresses to, and the retained bytes are always the END of the stream —
+// which is where historical_summaries + pending_* live in a BeaconState.
+function snappyFramedTail(data: Uint8Array, start: number, keep: number): Uint8Array {
+  const ring = new Uint8Array(keep)
+  let head = 0, filled = 0
+  const push = (chunk: Uint8Array) => {
+    let off = 0
+    const n = chunk.length
+    if (n >= keep) { ring.set(chunk.subarray(n - keep)); head = 0; filled = keep; return }
+    while (off < n) {
+      const w = Math.min(keep - head, n - off)
+      ring.set(chunk.subarray(off, off + w), head)
+      head = (head + w) % keep
+      off += w
+    }
+    filled = Math.min(keep, filled + n)
+  }
+  let s = start
+  while (s + 4 <= data.length) {
     const type = data[s], len = readU24LE(data, s + 1); s += 4
     if (s + len > data.length) break
-    if (type === 0x00 && len > 4) {
-      const blk = snappyDecompressBlock(data.subarray(s + 4, s + len))
-      const n = Math.min(blk.length, need - pos); out.set(blk.subarray(0, n), pos); pos += n
-    } else if (type === 0x01 && len > 4) {
-      const n = Math.min(len - 4, need - pos); out.set(data.subarray(s + 4, s + 4 + n), pos); pos += n
-    }
-    // 0xff stream-id, 0xfe padding, 0x80-0xfd skippable — ignore
+    if (type === 0x00 && len > 4) push(snappyDecompressBlock(data.subarray(s + 4, s + len)))
+    else if (type === 0x01 && len > 4) push(data.subarray(s + 4, s + len))
     s += len
   }
-  return out.subarray(0, pos)
+  if (filled < keep) return ring.subarray(0, filled)
+  const out = new Uint8Array(keep)
+  out.set(ring.subarray(head)); out.set(ring.subarray(0, head), keep - head)
+  return out
 }
 
 function readVarintU(data: Uint8Array, s: number): number | null {
@@ -351,7 +365,14 @@ function snappyResync(data: Uint8Array, n = 4): number {
 // so the FRONT read only needs block_roots (~700 KB) instead of the full 2.74 MB fixed
 // section. A wrong count yields a wrong leaf 27 → fails the field-proof/Helios check.
 const CAPELLA_ERA: Record<number, number> = { 1: 758, 11155111: 222, 17000: 0 }
-const HS_TAIL_FETCH = 20_000_000  // compressed suffix to cover hs + pending_* at the tail
+// Compressed suffix fetched from the end of the state — must reach back (in compressed
+// space) past historical_summaries. hs + the pending_* lists after it are only a few MB
+// today; 32 MB compressed leaves generous headroom for pending-list growth.
+const HS_TAIL_FETCH = 32_000_000
+// Decompressed bytes retained from the END of that suffix. historical_summaries sits a
+// few MB before the state end; 24 MB covers it with wide margin for pending-list growth,
+// and is independent of how the fields BEFORE it grow (rolling tail, memory-bounded).
+const HS_TAIL_KEEP = 24_000_000
 
 /**
  * Fetch the raw historical_summaries blob (N×64 bytes) from a (published) era file, without
@@ -414,13 +435,18 @@ async function tryEraUrlHS(url: string, era: number, chainId: number): Promise<U
     blockRoots.push(frontSSZ.slice(BLOCK_ROOTS_SSZ_OFFSET + i * 32, BLOCK_ROOTS_SSZ_OFFSET + (i + 1) * 32))
   const lastBSR = getBytes(computeEraBlockSummaryRoot(blockRoots))  // = hs[last].block_summary_root
 
-  // ── TAIL: suffix range → resync → decompress to end ──
+  // ── TAIL: suffix range → resync → decompress, keeping the decompressed END ──
+  // historical_summaries sits a few MB before the state's end (only the pending_*
+  // lists follow it). Decompress the whole fetched suffix but retain only the last
+  // HS_TAIL_KEEP bytes, so growth of the highly-compressible fields BEFORE it
+  // (validators/participation/inactivity) can never push the end out of view — that
+  // was the previous "first-N-bytes" cap's failure mode as the state grew.
   const tailStart = Math.max(dataStart, dataEnd + 1 - HS_TAIL_FETCH)
   const suffix = await eraFetch(url, `bytes=${tailStart}-${dataEnd}`, 120_000)
   if (!suffix) return null
   const rs = tailStart === dataStart ? 0 : snappyResync(suffix.buf)
   if (rs < 0) return null
-  const tailU = snappyFramedFrom(suffix.buf, rs, 64_000_000)
+  const tailU = snappyFramedTail(suffix.buf, rs, HS_TAIL_KEEP)
 
   // ── align via hs[last].block_summary_root (L-free) ──
   const target = hexlify(lastBSR)

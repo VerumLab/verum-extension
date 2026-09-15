@@ -17,7 +17,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'cleanup-contract-storage-2026-09-03T06'
+const BUILD_ID = 'era-tail-hs-fetch-fix-2026-09-15T04'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 

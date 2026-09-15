@@ -3,7 +3,7 @@
 // historical_summaries[hsIndex].block_summary_root — plus block_roots[slot % 8192]
 // directly for any target slot within the state's rolling 8192-slot window.
 
-import { computeBeaconStateRoot } from '../ssz-state-verifier.js'
+import { computeBeaconStateRoot, isGloasSlot } from '../ssz-state-verifier.js'
 import { readU32LE } from '../beacon-primitives.js'
 import type { StateSource } from '../../../types.js'
 
@@ -72,10 +72,10 @@ export async function getBlockSummaryRoot(
     // does this) would hang forever on arrayBuffer(). If no chunk arrives for STALL_MS,
     // abort so the caller fails over to the next provider.
     const stateSSZ = await downloadWithStallTimeout(res, 20_000)
-    const verifier = computeBeaconStateRoot(stateSSZ)
 
     // slot is at byte 40 of BeaconState SSZ (genesis_time[8] + genesis_validators_root[32])
     const stateSlot = readU32LE(stateSSZ, 40)
+    const verifier = computeBeaconStateRoot(stateSSZ, isGloasSlot(chainId, stateSlot) ? 'gloas' : undefined)
 
     if (verifier.computedRoot.toLowerCase() !== anchorStateRoot.toLowerCase()) {
       console.log(`[w3] State slot=${stateSlot} anchorSlot=${anchorSlot} diff=${stateSlot - anchorSlot} — Helios will confirm at end`)
