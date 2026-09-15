@@ -30,6 +30,8 @@ In the address bar, type `w3` + Tab, then enter:
 - calldata source: `blockNumber:txIndex[+blockNumber:txIndex+...]`
 - contract source: `0x`
 
+Examples: `w3://hellomainnet.eth` and `w3://strawmap.gwei`
+
 ### Deploy a website 
 
 **From the extension:** click **⬆ Deploy** in the popup, follow deployment flow. Deploys as calldata.
