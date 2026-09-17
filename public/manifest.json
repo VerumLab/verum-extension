@@ -3,7 +3,7 @@
   "name": "Verum",
   "short_name": "verum",
   "version": "0.1.0",
-  "description": "Browse w3:// dapps stored as calldata on Ethereum, verified by Helios light client",
+  "description": "Browse w3:// dapps, websites and data stored on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",
     "storage"

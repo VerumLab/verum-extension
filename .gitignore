@@ -33,3 +33,6 @@ scripts/.strawmap-tmp/
 *.log
 npm-debug.log*
 test/.verification-flow-proof.mjs
+
+# Example pages
+examples/
