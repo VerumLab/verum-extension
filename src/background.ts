@@ -11,15 +11,28 @@ import type { ContractContent } from './lib/w3/erc5219.js'
 import { verifyViaBeacon, isEip2935Error, SUPERSEDED } from './lib/verify/beacon-verifier.js'
 import { timestampToSlot } from './lib/verify/beacon-primitives.js'
 import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
-import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
+import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS, AGREEMENT_VERSION } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode, HistSource } from './types.js'
 import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask-bridge.js'
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'era-tail-hs-fetch-fix-2026-09-15T04'
+const BUILD_ID = 'onboarding-tos-gate-2026-09-17T01'
 
 console.log(`[w3] background build ${BUILD_ID}`)
+
+// First install → open the Terms-of-Use onboarding page.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    chrome.tabs.create({ url: chrome.runtime.getURL('onboarding.html') })
+  }
+})
+
+// True once the user has accepted the current Terms of Use on the onboarding page.
+async function agreementAccepted(): Promise<boolean> {
+  const { agreement } = await chrome.storage.local.get('agreement') as { agreement?: { accepted?: boolean; version?: number } }
+  return !!agreement?.accepted && (agreement.version ?? 0) >= AGREEMENT_VERSION
+}
 
 // Lag (seconds behind) at which an OOS instance is considered unrecoverable and
 // the WASM is torn down and re-synced, rather than re-probed in place.
@@ -413,7 +426,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Omnibox
 // ---------------------------------------------------------------------------
 
-chrome.omnibox.onInputEntered.addListener((text, disposition) => {
+chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
+  // Gate on Terms acceptance — send the user to onboarding until they agree.
+  if (!(await agreementAccepted())) {
+    chrome.tabs.create({ url: chrome.runtime.getURL('onboarding.html') })
+    return
+  }
   const trimmed = text.trim()
   const url = trimmed.startsWith('w3://') ? trimmed : `w3://${trimmed}`
   if (disposition === 'currentTab') {
@@ -424,7 +442,7 @@ chrome.omnibox.onInputEntered.addListener((text, disposition) => {
 })
 
 chrome.omnibox.onInputChanged.addListener((_text, suggest) => {
-  suggest([{ content: 'w3://', description: 'Enter an ENS/GNS name (e.g. myapp.eth or myapp.gwei) or block:txIndex' }])
+  suggest([{ content: 'w3://', description: 'Enter an ENS/GNS/WNS name (e.g. myapp.eth, myapp.gwei, or myapp.wei) or block:txIndex' }])
 })
 
 // ---------------------------------------------------------------------------

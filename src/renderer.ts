@@ -2,6 +2,7 @@ import { formatWeb3URL, parseWeb3URL } from './lib/w3/url-parser.js'
 import { parseBundle, bundleFileAt } from './lib/w3/content.js'
 import { buildDappHtml } from './lib/w3/dapp-html.js'
 import { startRocketGame, stopRocketGame } from './rocket-game.js'
+import { AGREEMENT_VERSION } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate } from './types.js'
 
 const splash          = document.getElementById('splash') as HTMLDivElement
@@ -638,12 +639,18 @@ function pickWallet(wallets: Array<{ name: string; id: string }>): Promise<strin
 // Phase-2 pipeline in the background for the same tab).
 let navSeq = 0
 
-const initialUrl = location.hash.slice(1)
-if (initialUrl) {
-  navigate(initialUrl)
-} else {
-  setPhase('idle')
-}
+// Terms-of-Use gate: until the user accepts on the onboarding page, Verum loads
+// nothing — redirect there instead of rendering any content.
+void (async () => {
+  const { agreement } = await chrome.storage.local.get('agreement') as { agreement?: { accepted?: boolean; version?: number } }
+  if (!agreement?.accepted || (agreement.version ?? 0) < AGREEMENT_VERSION) {
+    location.replace(chrome.runtime.getURL('onboarding.html'))
+    return
+  }
+  const initialUrl = location.hash.slice(1)
+  if (initialUrl) navigate(initialUrl)
+  else setPhase('idle')
+})()
 
 window.addEventListener('hashchange', () => {
   const url = location.hash.slice(1)

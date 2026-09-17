@@ -1,7 +1,7 @@
 // Deploy page — publish a file or folder as W3FS calldata from the extension.
 // Wizard: select → preview (same sandbox as the renderer) → deploy via wallet
 // (MetaMask/Frame through the existing background bridges) → verify through the
-// normal web3-resolve pipeline → optionally link an owned .eth/.gwei name.
+// normal web3-resolve pipeline → optionally link an owned .eth/.gwei/.wei name.
 
 import { Interface, ensNormalize, namehash } from 'ethers'
 import { formatWeb3URL } from './lib/w3/url-parser.js'
@@ -929,11 +929,12 @@ function verifyFailed(msg: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 5 — link an owned .eth / .gwei name
+// Step 5 — link an owned .eth / .gwei / .wei name
 // ---------------------------------------------------------------------------
 
 const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e'
 const GNS_NFT      = '0x9D51D507BC7264d4fE8Ad1cf7Fe191933A0a81d6'
+const WNS_NFT      = '0x0000000000696760E15f265e828DB644A0c242EB'
 
 const REGISTRY_IFACE = new Interface([
   'function resolver(bytes32 node) view returns (address)',
@@ -1068,8 +1069,8 @@ linkNameBtn.addEventListener('click', async () => {
     setNameStatus('fail', 'Invalid name.')
     return
   }
-  if (!/\.(eth|gwei)$/.test(name)) {
-    setNameStatus('fail', 'Name must end in .eth or .gwei')
+  if (!/\.(eth|gwei|wei)$/.test(name)) {
+    setNameStatus('fail', 'Name must end in .eth, .gwei, or .wei')
     return
   }
 
@@ -1083,10 +1084,34 @@ linkNameBtn.addEventListener('click', async () => {
     const value = JSON.stringify(coords.map(c => [c.blockNumber, c.txIndex]))
     const node = namehash(name)
     const isGns = name.endsWith('.gwei')
+    const isWns = name.endsWith('.wei')
     let to: string
     let data: string
 
-    if (isGns) {
+    if (isWns) {
+      if (chain?.chainId !== 1) {
+        throw new Error('WNS (.wei) names are currently available on Ethereum mainnet only. Select Mainnet first.')
+      }
+      setNameStatus('', `Checking ownership of ${name}…`, true)
+      const tokenId = BigInt(node)
+      let owner: string
+      try {
+        const res = await ethCall(WNS_NFT, NFT_IFACE.encodeFunctionData('ownerOf', [tokenId]))
+        owner = NFT_IFACE.decodeFunctionResult('ownerOf', res)[0] as string
+      } catch {
+        throw new Error(`"${name}" is not registered. Register it at wei.domains first.`)
+      }
+      if (owner.toLowerCase() !== signer.toLowerCase()) {
+        throw new Error(`"${name}" is owned by ${owner}, not the authorised account ${signer}. ` +
+          `Use "switch account" above to authorise the owning account.`)
+      }
+      const expRes = await ethCall(WNS_NFT, NFT_IFACE.encodeFunctionData('isExpired', [tokenId]))
+      if (NFT_IFACE.decodeFunctionResult('isExpired', expRes)[0] === true) {
+        throw new Error(`"${name}" is expired — renew it at wei.domains first.`)
+      }
+      to = WNS_NFT
+      data = NFT_IFACE.encodeFunctionData('setText', [tokenId, 'w3', value])
+    } else if (isGns) {
       setNameStatus('', `Checking ownership of ${name}…`, true)
       const tokenId = BigInt(node)
       let owner: string

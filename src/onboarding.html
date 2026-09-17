@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Welcome to Verum</title>
+  <link rel="stylesheet" href="./onboarding.css" />
+</head>
+<body>
+  <main id="card">
+    <!-- Step 1 — agree to the Terms -->
+    <section id="step-agree">
+      <h1 class="title">Let's get started</h1>
+      <p class="desc">Making web3 accessible. Directly visit Ethereum-stored websites, or retrieve Ethereum-stored data.</p>
+
+      <div class="logo">
+        <img src="./icons/128.png" alt="Verum" width="96" height="96" />
+        <span class="wordmark">Verum</span>
+      </div>
+
+      <label id="accept-row">
+        <input type="checkbox" id="accept-cb" />
+        <span>I agree to Verum extension's <a href="./terms.html" target="_blank" rel="noopener">Terms of Use</a></span>
+      </label>
+
+      <button id="continue" disabled>Start</button>
+    </section>
+
+    <!-- Step 2 — getting started -->
+    <section id="step-done" hidden>
+      <div class="logo">
+        <img src="./icons/128.png" alt="Verum" width="96" height="96" />
+        <span class="wordmark">Verum</span>
+      </div>
+      <h1 class="title">You're all set</h1>
+
+      <ol id="steps">
+        <li>
+          <strong>Pin Verum to your toolbar.</strong>
+          <span>Click the <span class="puzzle">🧩</span> extensions icon, then the pin next to Verum. The Verum extension shows each page's verification status.</span>
+        </li>
+        <li>
+          <strong>Start browsing.</strong>
+          <ul class="substeps">
+            <li>Type <code>w3</code> + Space and try <code>hellomainnet.eth</code>.</li>
+            <li>Or open the popup and type <code>hellomainnet.eth</code> in the URL bar of the extension.</li>
+          </ul>
+        </li>
+      </ol>
+    </section>
+  </main>
+  <script type="module" src="./onboarding.ts"></script>
+</body>
+</html>

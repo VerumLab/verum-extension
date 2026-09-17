@@ -12,6 +12,8 @@ export default defineConfig({
         renderer: resolve(__dirname, 'src/renderer.html'),
         popup: resolve(__dirname, 'src/popup.html'),
         settings: resolve(__dirname, 'src/settings.html'),
+        onboarding: resolve(__dirname, 'src/onboarding.html'),
+        terms: resolve(__dirname, 'src/terms.html'),
         deploy: resolve(__dirname, 'src/deploy.html'),
         background: resolve(__dirname, 'src/background.ts'),
         'dapp-sandbox':   resolve(__dirname, 'src/dapp-sandbox.html'),

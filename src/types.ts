@@ -59,6 +59,11 @@ export interface ChainConfig {
   eraFileUrls?: string[]              // era file base URLs (prepended before built-in defaults)
   parquetUrls?: string[]              // xatu parquet base URLs (prepended before built-in defaults)
   rpcBatchSizes?: Record<string, number>  // max JSON-RPC batch size per execution RPC URL
+  // The inactive RPC set, preserved across the local-mode toggle: when local mode is on
+  // these hold the public RPCs (and vice-versa), so editing the active set never touches
+  // the other. `rpcs`/`consensusRpcs` are always the ACTIVE set (what verification uses).
+  savedRpcs?: string[]
+  savedConsensusRpcs?: string[]
 }
 
 export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
@@ -218,3 +223,7 @@ export interface VerificationUpdate {
     cacheControl?: string   // ERC-5219 Cache-Control header: "immutable" ⇒ pinned artifact
   }
 }
+
+// Bump when the Terms of Use change materially — users must re-accept on the
+// onboarding page before Verum will load content again.
+export const AGREEMENT_VERSION = 1

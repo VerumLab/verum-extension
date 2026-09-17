@@ -101,7 +101,7 @@
     <section class="step hidden" id="step-name">
       <div class="step-head"><span class="step-num">5</span><h2>Link a name <span class="optional">optional</span></h2></div>
       <div class="step-body">
-        <p>Point an ENS (<code>.eth</code>) or GNS (<code>.gwei</code>) name you own at this
+        <p>Point an ENS (<code>.eth</code>), GNS (<code>.gwei</code>), or WNS (<code>.wei</code>) name you own at this
            deployment. This writes the <code>w3</code> text record with your wallet.</p>
 
         <!-- Shown only when linking a name to an already-deployed set of coordinates -->
@@ -121,7 +121,7 @@
 
         <div class="name-row">
           <input id="name-input" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="myapp.eth or myapp.gwei" />
+                 placeholder="myapp.eth, myapp.gwei, or myapp.wei" />
           <button id="link-name" class="primary">Link name</button>
         </div>
         <p id="name-status" class="hidden"></p>

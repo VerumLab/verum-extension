@@ -29,7 +29,7 @@ heliosReadsSwitch.addEventListener('change', () => {
 // so it goes through the normal verified w3:// path, not an HTTP mirror.
 document.getElementById('faq-link')!.addEventListener('click', (e) => {
   e.preventDefault()
-  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://extension.verum.gwei' })
+  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://extension.verum.gwei:1' })
 })
 
 async function updateCacheInfo() {
@@ -353,8 +353,29 @@ function buildCard(chain: ChainConfig): HTMLElement {
   }
   applyLocalMode(!!chain.localMode)
 
+  // Toggling local mode swaps the ACTIVE RPC set (what verification uses) between the
+  // public RPCs and localhost, auto-filling localhost defaults the first time. The set
+  // being left is stashed in savedRpcs/savedConsensusRpcs, so each set is independently
+  // editable — editing the localhost RPCs never changes the saved public ones.
+  const LOCAL_EXEC = 'http://localhost:8545'
+  const LOCAL_CONSENSUS = 'http://localhost:5052'
   localModeToggle.addEventListener('change', () => {
-    applyLocalMode(localModeToggle.checked)
+    const on = localModeToggle.checked
+    const curExec = rpcValues(executionList)
+    const curCons = rpcValues(consensusList)
+    // Switch TO the previously-saved set for the target mode, or sensible defaults.
+    const nextExec = chain.savedRpcs?.length ? chain.savedRpcs
+      : on ? [LOCAL_EXEC] : (DEFAULT_CHAINS[chain.chainId]?.rpcs ?? [])
+    const nextCons = chain.savedConsensusRpcs?.length ? chain.savedConsensusRpcs
+      : on ? [LOCAL_CONSENSUS] : (DEFAULT_CHAINS[chain.chainId]?.consensusRpcs ?? [])
+    // Preserve the set we're leaving as the inactive set.
+    chain.savedRpcs = curExec
+    chain.savedConsensusRpcs = curCons
+    executionList.innerHTML = ''
+    nextExec.forEach((u) => executionList.appendChild(execRpcRow(u, chain.rpcBatchSizes?.[u])))
+    consensusList.innerHTML = ''
+    nextCons.forEach((u) => consensusList.appendChild(rpcRow(u)))
+    applyLocalMode(on)
     syncCard()
   })
 
