@@ -36,10 +36,10 @@ Examples: `w3://hellomainnet.eth` and `w3://strawmap.gwei`
 
 **From the extension:** click **⬆ Deploy** in the popup, follow deployment flow. Deploys as calldata.
 
----
-
-Built with [Claude Code](https://claude.ai/code)
-
 ## License
 
 MIT © 2026 Verum LLC — see [LICENSE](LICENSE).
+
+---
+
+Built with [Claude Code](https://claude.ai/code)
