@@ -739,13 +739,13 @@ function rootListPendingConsolidations(data: Uint8Array): Uint8Array {
 // ---------------------------------------------------------------------------
 
 // Fork activation by slot (epoch = slot / 32). Determined from the known update
-// epoch per chain, NOT from state-structure heuristics. Gloas is the only fork
+// epoch per chain. Gloas is the only fork
 // whose BeaconState/BeaconBlockBody merkleization this file special-cases; the
 // pre-Gloas forks keep their existing serialization-driven detection. A chain not
-// listed (or with Gloas not yet scheduled → Infinity) is treated as pre-Gloas.
+// listed (or with Gloas not yet scheduled) is treated as pre-Gloas.
 const GLOAS_FORK_EPOCH: Record<number, number> = {
   1:          Infinity,   // mainnet — not scheduled yet
-  11155111:   Infinity,   // sepolia
+  11155111:   353024,     // sepolia — Gloas @ slot 11296768, 2026-10-06 13:53:36 UTC (eth-clients/sepolia#125)
   17000:      Infinity,   // holesky
   560048:     Infinity,   // hoodi
   7091047534: 1536,       // Platåberget Glamsterdam devnet

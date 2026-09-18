@@ -5,7 +5,7 @@
  * per link proving each check rejects a forgery:
  *
  *   PHASE 1 — content (common to all modes)
- *     ① ENS/GNS resolution        name → [[blockNumber, txIndex]]
+ *     ① Name resolution        name → [[blockNumber, txIndex]]
  *     ② W3FS parse + assembly      tx calldata → chunks → content bytes
  *   PHASE 2 — inclusion verification
  *     ③ Mode 1 (recent, Helios)    tx-trie over a trusted block → calldata + render binding
@@ -30,9 +30,9 @@ import {
   reconstructStateRootFromHistSummaries, verifyHistoricalSummariesFieldProof,
   computeSyncCommitteeRoot, hashNodes, computeExecutionPayloadHeaderRoot,
 } from '../src/lib/verify/ssz-state-verifier.js'
-import { fetchHistoricalSummariesFromEraFile, fetchEraBlockRootsFromEraFile } from '../src/lib/verify/downloader/era-file.js'
-import { fetchEraBlockRootsFromParquet } from '../src/lib/verify/downloader/era-parquet.js'
-import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from '../src/lib/verify/downloader/era-exec-headers.js'
+import { fetchHistoricalSummariesFromEraFile, fetchEraBlockRootsFromEraFile } from '../src/lib/verify/downloader/block-roots-era-file.js'
+import { fetchEraBlockRootsFromParquet } from '../src/lib/verify/downloader/block-roots-parquet.js'
+import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from '../src/lib/verify/downloader/block-roots-exec-headers.js'
 import { fetchFixedSectionAtSlot, getBlockSummaryRoot } from '../src/lib/verify/downloader/beacon-state.js'
 import { resolveEns, compareEnsChunks } from '../src/lib/w3/name-resolver.js'
 import { parseCalldata, assembleContent } from '../src/lib/w3/content.js'
@@ -117,7 +117,7 @@ async function main() {
   await harnessSelfTest()
 
   // ═══ PHASE 1 — content resolution & assembly ═════════════════════════════════════════════════
-  section('① ENS/GNS name resolution  (name → [[blockNumber, txIndex]] via resolver, at finalized)')
+  section('① name resolution  (name → [[blockNumber, txIndex]] via resolver, at finalized)')
   const res = await resolveEns(NAME, publicRpc)   // real namehash + registry/resolver + text("w3")
   ok(Array.isArray(res.chunks) && res.chunks.length > 0, `resolved "${NAME}" to a chunk list`, `${res.chunks.length} chunk(s)`)
   ok(res.chunks.every(c => Number.isInteger(c.blockNumber) && Number.isInteger(c.txIndex)),
@@ -125,7 +125,7 @@ async function main() {
   await rejects(() => resolveEns('this-name-is-not-registered-zzz.gwei', publicRpc), 'w3',
     'an unregistered name has no "w3" record → rejected')
 
-  section('①ᵇ ENS/GNS re-verification  (phase-2: re-resolve via Helios at finalized, compareEnsChunks vs phase 1)')
+  section('①ᵇ re-verification  (phase-2: re-resolve via Helios at finalized, compareEnsChunks vs phase 1)')
   const phase1Chunks = res.chunks
   const reresolved = (await resolveEns(NAME, publicRpc)).chunks   // production: this call goes through Helios
   ok(compareEnsChunks(reresolved, phase1Chunks) === true,

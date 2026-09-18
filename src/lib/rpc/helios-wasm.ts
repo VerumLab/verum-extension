@@ -3,15 +3,12 @@ import type { HeliosProvider, Network } from '@a16z/helios'
 import type { IVerifiedRpc } from './light-client.js'
 
 // EIP-4788 ring buffer — used as a probe to verify eth_getProof works on the exec RPC.
-// Infura free tier rejects eth_getProof outside the last ~128 blocks; the probe catches this
-// at init time so we can fall back to another exec RPC before committing to it for the session.
 const EIP4788_PROBE = '0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02'
 
 export class HeliosWasmClient implements IVerifiedRpc {
   private lastCheckpointSave = 0
   // Number of provider.request() calls currently awaiting the WASM, and a barrier that
-  // shutdown() waits on. Tearing down the WASM (provider.shutdown()) while a request is
-  // mid-flight re-enters the same wasm-bindgen object → "recursive use of an object".
+  // shutdown() waits on.
   // This lets an OOS-wedge restart evict-and-replace the instance without crashing an
   // in-flight verification call on it.
   private inFlight = 0
@@ -24,7 +21,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
   ) {}
 
   // Races up to 2 execution RPCs with an EIP-4788 proof probe; first to pass wins.
-  // Falls back to the first exec RPC unprobed if all probes fail (preserves prior behaviour).
+  // Falls back to the first exec RPC unprobed if all probes fail.
   static async create(
     network: Network,
     consensusRpc: string,
@@ -32,16 +29,14 @@ export class HeliosWasmClient implements IVerifiedRpc {
     forceFresh = false,
   ): Promise<HeliosWasmClient> {
     const checkpointKey = `helios_checkpoint_${network}`
-    // A wedged-instance restart passes forceFresh so the replacement re-anchors
+    // A  instance restart passes forceFresh so the replacement re-anchors
     // from a freshly-fetched finalized root instead of the checkpoint cached by
     // the instance that just wedged — reusing that value rebuilds the same anchor
     // and re-wedges. The fresh root is still saved below for the next warm start.
     const stored = forceFresh ? {} : await chrome.storage.session.get(checkpointKey)
-    // Legacy entries are bare strings; current format carries savedAt so a stale
-    // checkpoint (bootstrap endpoints 404 old roots) can be skipped instead of
-    // burning a doomed sync attempt before the live-root retry.
-    const raw = stored[checkpointKey] as string | { root: string; savedAt: number } | undefined
-    const cached = typeof raw === 'string' ? { root: raw, savedAt: 0 } : raw
+    // The stored checkpoint carries savedAt so a stale root (bootstrap endpoints 404 old
+    // roots) is skipped instead of burning a doomed sync attempt before the live-root retry.
+    const cached = stored[checkpointKey] as { root: string; savedAt: number } | undefined
     const cachedCheckpoint = cached && Date.now() - cached.savedAt < 20 * 60_000
       ? cached.root : undefined
 
@@ -123,22 +118,9 @@ export class HeliosWasmClient implements IVerifiedRpc {
   // Slots per epoch — light-client bootstrap data is indexed per epoch boundary.
   private static readonly SLOTS_PER_EPOCH = 32
 
-  // Returns a finalized checkpoint root that light_client/bootstrap will actually
-  // serve.
-  //
-  // /headers/finalized returns the finalized checkpoint, whose root is the last
-  // block at *or before* the epoch-boundary slot. When that boundary slot is
-  // empty (a skipped proposal), the root belongs to a block at a non-boundary
-  // slot — and beacon nodes only index bootstrap data for blocks sitting exactly
-  // on a boundary. Bootstrapping from it fails with:
-  //   404 NOT_FOUND: Sync committee branch for block root 0x… not found. This
-  //   typically occurs when the block is not a finalized checkpoint.
-  // which kills Helios init outright (and with it the whole verification path).
-  // It's intermittent: it only bites when the boundary proposal was skipped.
-  //
-  // So when the finalized root isn't on a boundary, walk back over earlier
-  // boundary slots until one has a block. An older finalized checkpoint is still
-  // a valid, still-finalized starting point — Helios syncs forward from it.
+  // Returns a finalized checkpoint root that light_client/bootstrap will serve.
+  // When the finalized root isn't on a boundary, walk back over earlier
+  // boundary slots until one has a block. 
   static async fetchFinalizedRoot(consensusRpc: string): Promise<string | undefined> {
     try {
       const res = await fetch(`${consensusRpc}/eth/v1/beacon/headers/finalized`)
@@ -181,16 +163,11 @@ export class HeliosWasmClient implements IVerifiedRpc {
     console.log(`${tag} creating provider (${checkpointLabel})`)
     // dbType is how Helios persists its own checkpoint between runs. Only
     // "localstorage" and "config" exist. localStorage does not exist in a service
-    // worker, so "localstorage" made Helios log
-    //   "Helios: localStorage unavailable, falling back to in-memory checkpoint storage"
-    // and fall back to a store that dies with the worker — i.e. it never persisted
-    // anything anyway.
+    // worker.
     //
-    // "config" is the honest description of what we actually do: we persist the
-    // checkpoint ourselves in chrome.storage.session (see saveCheckpoint /
+    // Fix: persist the checkpoint in chrome.storage.session (see saveCheckpoint /
     // fetchFinalizedRoot) and hand it in via `checkpoint` on every start. Helios
     // then reads the checkpoint from config and stops pretending it has a DB.
-    // Same behaviour, minus the misleading warning.
     const provider = await createHeliosProvider(
       { network, consensusRpc, executionRpc, dbType: 'config', checkpoint },
       'ethereum',
@@ -229,11 +206,6 @@ export class HeliosWasmClient implements IVerifiedRpc {
   private async _request<T>(method: string, params: unknown[], quickFail = false): Promise<T> {
     // Guard against WASM hangs: if provider.request() never resolves (WASM panic,
     // OOM, etc.) the acquireEthCallSlot slot held by the caller is never released.
-    // The timeout ensures slots are always released. A heavy aggregator eth_call
-    // (e.g. a DEX quoter touching dozens of pools) legitimately takes tens of seconds
-    // under Helios because it fetches eth_getProof for all touched state — a 20s cap
-    // failed those calls, and dapps that split-and-retry on failure (mc3-style) then
-    // storm the RPC forever. 45s lets the big call complete so it never has to split.
     const startedAt = Date.now()
     const call = (): Promise<T> =>
       Promise.race([
@@ -275,10 +247,8 @@ export class HeliosWasmClient implements IVerifiedRpc {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
-    // Wait for in-flight requests to settle before tearing down the WASM — calling
-    // provider.shutdown() while a request holds the wasm-bindgen borrow panics with
-    // "recursive use of an object". Bounded so a genuinely hung call can't block eviction
-    // forever (the 45s request timeout releases it anyway).
+    // Wait for in-flight requests to settle before tearing down the WASM. 
+    // Bounded so a genuinely hung call can't block eviction forever.
     if (this.inFlight > 0) {
       await Promise.race([
         new Promise<void>(resolve => this.idleWaiters.push(resolve)),

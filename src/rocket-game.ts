@@ -1,8 +1,4 @@
-// Tiny "dino-game" replacement for the error panel. The Ethereum-diamond ship
-// sits fixed in the middle; obstacles fall from above; the player dodges LEFT
-// and RIGHT with the arrow keys. Self-contained, no deps. Mounted only while the
-// error phase is on screen. Grace period at the start, then it ramps up.
-
+// Tiny "game" for the error panel. The Ethereum-diamond rocket.
 let raf = 0
 let mounted: HTMLDivElement | null = null
 let teardown: (() => void) | null = null

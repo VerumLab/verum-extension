@@ -1,3 +1,9 @@
+import { DAPP_BASE } from './lib/w3/dapp-html.js'
+
+// Hostname of DAPP_BASE ('dapp.w3fs'), for the same-origin checks in the injected srcdoc JS.
+// Single source of truth — DAPP_BASE is defined once in dapp-html.ts.
+const DAPP_HOST = new URL(DAPP_BASE).hostname
+
 type RenderMessage = {
   type: 'render'
   html: string
@@ -118,7 +124,7 @@ return '<scr' + 'ipt>(function(){' +
   // which is not a valid base for relative URL resolution.
   'var _U=window.URL;' +
   'function PU(u,b){' +
-    'if(!b||b==="about:srcdoc"||b===location.href)b="https://dapp.w3fs/";' +
+    'if(!b||b==="about:srcdoc"||b===location.href)b="' + DAPP_BASE + '";' +
     'return new _U(u,b);' +
   '}' +
   'PU.createObjectURL=_U.createObjectURL.bind(_U);' +
@@ -241,7 +247,7 @@ return '<scr' + 'ipt>(function(){' +
     'if(!a)return;' +
     'var h=(typeof a.href==="string")?a.href:(a.href&&a.href.baseVal)||a.getAttribute("xlink:href")||a.getAttribute("href");' +
     'if(!h)return;' +
-    'try{var u=new URL(h,"https://dapp.w3fs/");' +
+    'try{var u=new URL(h,"' + DAPP_BASE + '");' +
       // Same-document hash navigation (SPA hash router). A srcdoc iframe\'s base URL is the
       // containing frame (dapp-sandbox.html), so <a href="#/route"> resolves to
       // dapp-sandbox.html#/route — a default click NAVIGATES the frame there (blank page)
@@ -260,7 +266,7 @@ return '<scr' + 'ipt>(function(){' +
           'else window.dispatchEvent(new HashChangeEvent("hashchange"));' +
           'return;' +
         '}}catch(_e){}' +
-      'if(u.hostname==="dapp.w3fs")return;' +
+      'if(u.hostname==="' + DAPP_HOST + '")return;' +
       'if(u.protocol==="w3:"){' +
         'e.preventDefault();window.parent.postMessage({type:"w3-navigate",url:h},"*");return;' +
       '}' +

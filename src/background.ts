@@ -13,13 +13,9 @@ import { timestampToSlot } from './lib/verify/beacon-primitives.js'
 import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
 import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS, AGREEMENT_VERSION } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode, HistSource } from './types.js'
-import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask-bridge.js'
-import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
+import { listWallets, ethRequest as walletRequest } from './lib/wallets/extension-wallet-bridge.js'
+import { isFrameAvailable, frameRequest } from './lib/wallets/local-wallet-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
-
-const BUILD_ID = 'onboarding-tos-gate-2026-09-17T01'
-
-console.log(`[w3] background build ${BUILD_ID}`)
 
 // First install → open the Terms-of-Use onboarding page.
 chrome.runtime.onInstalled.addListener((details) => {
@@ -36,36 +32,20 @@ async function agreementAccepted(): Promise<boolean> {
 
 // Lag (seconds behind) at which an OOS instance is considered unrecoverable and
 // the WASM is torn down and re-synced, rather than re-probed in place.
-//
-// This was 30s, which is *inside* normal drift: Helios's head age is the time
-// since the last block's timestamp, so it climbs between blocks and resets when
-// one lands. Measured steady-state peaks are ~28s on mainnet and ~49s on Sepolia
-// (which has skipped slots) — both perfectly healthy. Helios itself only reports
-// OOS past 60s. So a lag of 30-60s at the moment OOS fires is a transient blip
-// that the next optimistic update (~12s away) heals on its own; evicting there
-// threw away a healthy instance, and the replacement started behind and tripped
-// OOS again — a restart loop that looked like "Helios OOS immediately".
-// Only a lag far outside that envelope indicates the WASM is genuinely wedged in
-// internal backoff. Persistent-but-smaller lag is still caught by the
-// oosExhaustionCount path, which restarts after 2 full failed probe cycles.
 const OOS_RESTART_LAG_SECONDS = 150
 
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
 
 // Removes a chain's WASM instance from the cache AND shuts it down. Deleting
 // the cache entry alone leaks the instance: its internal polling loops keep
-// running with no JS reference, and accumulated zombies starve the SW event
-// loop (the original cause of chrome.storage hangs / stuck page loads).
+// running with no JS reference.
 function evictChainRpc(chainId: number) {
   const old = rpcCache.get(chainId)
   rpcCache.delete(chainId)
   old?.then(rpc => (rpc as { shutdown?: () => Promise<void> }).shutdown?.().catch(() => {})).catch(() => {})
 }
 
-// Diagnostic-only: after repeated wedged restarts, probe the configured consensus
-// endpoints directly for their current optimistic head. The OOS "N seconds behind"
-// lag is head-timestamp vs wall-clock, and the head only advances via consensus
-// optimistic updates — so a genuinely stale feed and a healthy feed with a wedged
+// Diagnostic-only: a genuinely stale feed and a healthy feed with a wedged
 // WASM instance produce the SAME symptom from the instance's side. This records
 // which one it actually is so the log stops mislabeling a healthy feed as stale.
 // Never throws; hits the real consensus URLs, not the proxy sentinels.
@@ -127,7 +107,7 @@ const pendingReads = new Map<number, PendingRead[]>()
 const heliosInflight = new Map<string, Promise<{ result?: unknown; error?: string }>>()
 
 // Stale-while-revalidate cache for small primitive reads only.
-// eth_call and similar can return megabytes of ABI-encoded data — caching those
+// eth_call and similar can return megabytes oded of ABI-encdata — caching those
 // inflates the SW heap unboundedly under a polling dapp and triggers OOM.
 // Only cache methods whose results are always small (< ~100 bytes).
 const CACHEABLE_METHODS = new Set([
@@ -139,14 +119,7 @@ const MAX_READ_CACHE = 200
 
 // Trusted-reads toggle: when on, dapp RUNTIME reads (eth_call quotes, balances, …) are
 // served from the fast execution RPC WITHOUT Helios verification, so a read-heavy dapp
-// (DEX quoter firing hundreds of eth_calls) responds at normal-RPC speed instead of
-// waiting on per-slot eth_getProof. Page CONTENT stays Helios-verified regardless — this
-// only affects post-load reads. Transient (chrome.storage.session): resets each browser
-// session, so the safe verified default returns automatically. Mirrored in memory to
-// avoid a storage round-trip per read; kept in sync via storage.onChanged below.
-// Defaults to true (trusted RPC): read-heavy dApps work out of the box like on any normal
-// wallet/RPC. Helios-verified reads are opt-in via the "Helios reads" switch. Page CONTENT
-// is still Helios-verified at load regardless — only post-load reads follow this flag.
+// responds at normal-RPC speed instead of waiting on per-slot eth_getProof. 
 let trustedReads = true
 chrome.storage.session.get('trustedReads').then(v => { trustedReads = v.trustedReads !== false }).catch(() => {})
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -155,14 +128,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 // Concurrency limit for non-cacheable Helios reads (eth_call, eth_getLogs, …).
 // Each concurrent call holds a large ABI-encoded result in memory while the IPC
-// clone travels to the renderer. 20+ simultaneous clones exhaust the renderer
-// heap and Chrome kills the process (error 5). Cap at 4 concurrent slots so at
+// clone travels to the renderer. Cap at 4 concurrent slots so at
 // most 4 large results exist in memory at once.
 let ethCallSlots = 0
-// Read-heavy dapps (DEX quoters that fan out multicalls across many venues) need
-// more parallel Helios reads to complete a quote in reasonable time. Quote results
-// are small, so the memory concern behind this cap (large content clones) doesn't
-// apply to them — 8 balances throughput against the renderer-heap limit.
+// Read-heavy dapps need more parallel Helios reads.
+// 8 balances throughput against the renderer-heap limit.
 const ETH_CALL_MAX_SLOTS = 8
 const ethCallWaiters: Array<() => void> = []
 function acquireEthCallSlot(): Promise<() => void> {
@@ -274,11 +244,6 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
         } catch (err: any) {
           if (!(err?.message ?? '').includes('out of sync')) return rpc  // non-OOS error, proceed
           lastLag = (err.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
-          // A lag at/beyond the restart threshold isn't drift waiting to heal —
-          // the WASM's internal update loop has wedged and the head won't advance
-          // (classic long-open-page symptom: lag *grows* each poll). Don't wait out
-          // the full 60s cycle; the keepalive path can't rescue us here because the
-          // instance isn't in freshRpcReady yet. Bail now for an immediate restart.
           if (Number(lastLag) >= OOS_RESTART_LAG_SECONDS) { wedged = true; break }
         }
         if (i > 0 && i % 10 === 0) {
@@ -304,12 +269,9 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
         heliosSyncingSignaled.delete(chain.chainId)
         const emsg = err?.message ?? ''
         if (emsg.includes('OOS wedged')) {
-          // Lag past the restart threshold — don't burn two 60s exhaustion cycles
-          // first. Evict the wedged WASM instance and re-probe on a fresh one now;
+          // Evict the wedged WASM instance and re-probe on a fresh one now;
           // bootstrap re-anchors to the current finalized checkpoint, so the
-          // replacement comes up current instead of 150s+ behind. Guard against a
-          // genuinely dead consensus feed (fresh instance immediately wedged again):
-          // after a few immediate restarts, back off so we don't hammer bootstrap.
+          // replacement comes up current instead of 150s+ behind. 
           const n = (oosExhaustionCount.get(chain.chainId) ?? 0) + 1
           oosExhaustionCount.set(chain.chainId, n)
           // The replacement must re-anchor from a fresh finalized root — the
@@ -366,7 +328,7 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 // Retrieve calldata from a local Portal node when the execution RPC doesn't
-// have the historical transaction. Requires blockNumber + txIndex in the ENS record.
+// have the historical transaction. Requires blockNumber + txIndex in the name record.
 async function fetchCalldataFromPortal(
   portalRpc: string,
   chunk: TxRef,
@@ -398,12 +360,7 @@ async function fetchCalldataFromPortal(
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // A committed top-level URL change invalidates the previous page's verification
-  // for this tab. Without this, navigating away (or to a new w3:// page) left the
-  // old `proof_${tabId}` in session storage, so the popup kept showing the prior
-  // page's proof even though its badge was gone. Bump the generation first so any
-  // in-flight phase 2 for the old page sees itself superseded and can't re-write
-  // the proof after we clear it; then clear the badge + stored proof so the popup
-  // reads idle until the new page (if any) produces its own proof.
+  // for this tab. 
   if (changeInfo.url) {
     tabVerGen.set(tabId, (tabVerGen.get(tabId) ?? 0) + 1)
     clearBadge(tabId)
@@ -475,9 +432,7 @@ chrome.runtime.onConnect.addListener((port) => {
     //
     // The port itself is what keeps the service worker alive, so it stays open for
     // every page. But the health-check/restart work below is skipped unless the
-    // page actually has scripts that can make eth calls (needsEth) — a plain HTML
-    // page has nothing to serve, and probing for it kept a Helios instance in a
-    // permanent OOS/restart cycle for no reason.
+    // page actually has scripts that can make eth calls.
     port.onMessage.addListener(async (msg) => {
       if (!(msg as { needsEth?: boolean } | undefined)?.needsEth) return
       const stored = await chrome.storage.sync.get('chains')
@@ -519,8 +474,9 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   if (port.name === 'eth-request') {
+    const tabId = port.sender?.tab?.id
     port.onMessage.addListener(async (msg) => {
-      const resp = await handleEthRequest(msg.method, msg.params ?? [], msg.walletId)
+      const resp = await handleEthRequest(msg.method, msg.params ?? [], msg.walletId, tabId)
       try { port.postMessage(resp) } catch {}
     })
   }
@@ -532,7 +488,6 @@ async function twoPhaseResolve(
   port: chrome.runtime.Port,
 ) {
   console.clear()
-  console.log(`[w3] background build ${BUILD_ID}`)
   console.log('[w3] twoPhaseResolve start', rawUrl)
   const send = (msg: BgResponse) => { try { port.postMessage(msg) } catch {} }
 
@@ -650,7 +605,7 @@ async function twoPhaseResolve(
     return
   }
 
-  // Send content to renderer — page shows NOW
+  // Send content to renderer
   send({ type: 'content', assembled: Array.from(assembled), contentType })
 
   // Per-chunk refs for the proof panel — the singular proof fields describe the
@@ -1439,8 +1394,8 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
   }
 
   // Trusted-reads mode: forward runtime reads to the fast execution RPC, no Helios.
-  // (Content was still Helios-verified at load; this only speeds up post-load reads
-  // like DEX quotes.) Not cached in heliosReadCache — those results are unverified and
+  // (Content was still Helios-verified at load; this only speeds up post-load reads)
+  // Not cached in heliosReadCache — those results are unverified and
   // must not pollute the verified cache used by the Helios path.
   if (trustedReads) {
     try {
@@ -1570,11 +1525,44 @@ async function listAvailableWallets(): Promise<Array<{ name: string; id: string 
   return frame ? [...direct, { name: 'Frame', id: '__frame__' }] : direct
 }
 
-async function handleEthRequest(method: string, params: unknown[], walletId: string): Promise<unknown> {
+// Per-wallet open-connection tracking, keyed by tab. The shared wallet (MetaMask/Frame)
+// is one connection behind every open dapp, so a dapp's disconnect (wallet_revokePermissions)
+// must only tear down that shared grant when it's the LAST tab using the wallet — otherwise
+// disconnecting one dapp revokes the wallet for every other open dapp. Separate sets per
+// walletId keep MetaMask and Frame counted independently.
+const walletTabs = new Map<string, Set<number>>()
+function registerWalletTab(walletId: string, tabId: number | undefined) {
+  if (tabId === undefined) return
+  if (!walletTabs.has(walletId)) walletTabs.set(walletId, new Set())
+  walletTabs.get(walletId)!.add(tabId)
+}
+// Drops the tab and returns true if this was the LAST open connection for that wallet.
+function releaseWalletTab(walletId: string, tabId: number | undefined): boolean {
+  const set = walletTabs.get(walletId)
+  if (!set) return true
+  if (tabId !== undefined) set.delete(tabId)
+  if (set.size === 0) { walletTabs.delete(walletId); return true }
+  return false
+}
+chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const set of walletTabs.values()) set.delete(tabId)
+})
+
+const CONNECT_METHODS_BG = new Set(['eth_requestAccounts', 'wallet_requestPermissions'])
+
+async function handleEthRequest(method: string, params: unknown[], walletId: string, tabId?: number): Promise<unknown> {
+  // Disconnect: forward the revoke to the wallet only when this is the last open connection.
+  // Otherwise drop just this tab and report success — the dapp disconnects locally without
+  // tearing down the shared wallet grant that other open dapps still rely on.
+  if (method === 'wallet_revokePermissions') {
+    if (!releaseWalletTab(walletId, tabId)) return { result: null }
+  }
   try {
     const result = walletId === '__frame__'
       ? await frameRequest(method, params)
       : await walletRequest(walletId, method, params)
+    // Count the tab once its connect succeeds, so the counter reflects live grants.
+    if (CONNECT_METHODS_BG.has(method)) registerWalletTab(walletId, tabId)
     return { result }
   } catch (err: any) {
     return { error: err.message ?? String(err) }

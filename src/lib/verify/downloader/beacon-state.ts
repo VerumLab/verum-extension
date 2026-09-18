@@ -8,12 +8,10 @@ import { readU32LE } from '../beacon-primitives.js'
 import type { StateSource } from '../../../types.js'
 
 // Checkpoint sync providers serve gzip-compressed BeaconState via the same debug endpoint.
-// Mainnet: ~136 MB compressed (vs ~313 MB uncompressed), ~39 s on a typical connection.
-// These always serve the latest finalized state, so we request 'finalized' instead of a slot.
+// Mainnet: ~136 MB compressed (vs ~313 MB uncompressed).
+// These always serve the latest finalized state, request 'finalized' instead of slot.
 const CHECKPOINT_SYNC_RPCS: Record<number, string[]> = {
   1: [
-    // Ordered fastest-first from measured throughput; the stall-timeout + failover in
-    // getBlockSummaryRoot handles any that go slow/dead, so order is only a head start.
     'https://mainnet.checkpoint.sigp.io',
     'https://beaconstate.ethstaker.cc',
     'https://beaconstate-mainnet.chainsafe.io',
@@ -45,15 +43,8 @@ export async function getBlockSummaryRoot(
   stateSource: StateSource = 'auto',
 ): Promise<StateSummary> {
   // open(): resolve the download slot and fetch the response HEADERS (fast, race-able).
-  // consume(): download the ~300MB SSZ body and verify (slow — runs for the winner only).
-  // Splitting them is the whole point: the mainnet BeaconState is ~332 MB, so starting
-  // one download per provider (the old shared-controller stagger did) just splits
-  // bandwidth and memory across four 332 MB streams and stalls them all. Now the first
-  // provider to return a 200 wins and downloads alone; the rest are aborted.
-
+  // consume(): download the ~300MB SSZ body and verify (runs for the winner only).
   const open = async (rpc: string, ac: AbortController): Promise<OpenState> => {
-    // A staggered loser whose timer fires after the winner already aborted it: skip quietly so
-    // it doesn't log a misleading "Fetching state" for a download that never actually starts.
     if (ac.signal.aborted) throw new Error('open aborted before start')
     const stateId = await fetchLiveDlSlot(rpc, ac.signal)
     console.log(`[w3] Fetching state (slot ${stateId}) from ${rpc}…`)
@@ -66,17 +57,11 @@ export async function getBlockSummaryRoot(
   }
 
   const consume = async ({ rpc, res }: OpenState): Promise<StateSummary> => {
-    // Stream with stall detection. The state is ~136 MB gzipped over the wire (~332 MB
-    // decompressed) and the free checkpoint CDNs run 4-8 MB/s, so this legitimately takes
-    // 40-70s — but a provider that returns 200 headers and then stalls its body (chainsafe
-    // does this) would hang forever on arrayBuffer(). If no chunk arrives for STALL_MS,
-    // abort so the caller fails over to the next provider.
+    // Stream with stall detection. 
     const stateSSZ = await downloadWithStallTimeout(res, 20_000)
-
     // slot is at byte 40 of BeaconState SSZ (genesis_time[8] + genesis_validators_root[32])
     const stateSlot = readU32LE(stateSSZ, 40)
     const verifier = computeBeaconStateRoot(stateSSZ, isGloasSlot(chainId, stateSlot) ? 'gloas' : undefined)
-
     if (verifier.computedRoot.toLowerCase() !== anchorStateRoot.toLowerCase()) {
       console.log(`[w3] State slot=${stateSlot} anchorSlot=${anchorSlot} diff=${stateSlot - anchorSlot} — Helios will confirm at end`)
     } else {
@@ -109,12 +94,8 @@ export async function getBlockSummaryRoot(
     ? customCheckpointUrls
     : (CHECKPOINT_SYNC_RPCS[chainId] ?? [])
 
-  // Race checkpoint providers and consensus RPCs — interleaved so both types start early.
-  // Stagger 3s between each start: a fast failure triggers the next immediately while
-  // a slow download stays solo to avoid parallel bloat.
-  // Checkpoint CDNs only retain their current finalized epoch boundary. By the time a 27h
-  // cache expires the chain has advanced several epochs and anchorSlot-32 is gone. Query
-  // each CDN's live finalized slot first and request that - 32 (the epoch boundary they hold).
+  // Race checkpoint providers and consensus RPCs.
+  // Stagger 3s between each start: a fast failure triggers the next immediately.
   // Consensus RPC nodes serve any recent slot so anchorSlot-32 is fine.
   const dlSlot = anchorSlot - 32
 
@@ -133,8 +114,7 @@ export async function getBlockSummaryRoot(
     return dlSlot
   }
 
-  // Dev mode pins one side of the race so a failure there is visible instead of
-  // being masked by the other side winning.
+  // Dev mode pins one side of the race.
   const useCheckpoints = stateSource !== 'consensus-rpc'
   const useConsensus   = stateSource !== 'checkpoint'
   if (stateSource !== 'auto') {
@@ -195,9 +175,6 @@ export async function getBlockSummaryRoot(
 interface OpenState { rpc: string; res: Response }
 
 // Read a response body to completion, aborting if no chunk arrives for `stallMs`.
-// A total timeout would be wrong here — a healthy 332 MB state legitimately takes
-// 40-70s — so we time the GAP between chunks instead, which catches a stalled
-// stream without penalising a slow-but-progressing one.
 async function downloadWithStallTimeout(res: Response, stallMs: number): Promise<Uint8Array> {
   if (!res.body) return new Uint8Array(await res.arrayBuffer())
   const reader = res.body.getReader()
@@ -227,8 +204,6 @@ async function downloadWithStallTimeout(res: Response, stallMs: number): Promise
 }
 
 // Run async thunks with a stagger between starts; resolve with the first success.
-// A fast rejection (dead provider) does NOT wait out the stagger for the next start —
-// the timers are already scheduled — but a slow success holds the field without piling on.
 function staggeredRace<T>(thunks: Array<() => Promise<T>>, gapMs: number): Promise<T> {
   return Promise.any(thunks.map((fn, i) =>
     i === 0
@@ -239,10 +214,7 @@ function staggeredRace<T>(thunks: Array<() => Promise<T>>, gapMs: number): Promi
 
 // Early-abort fetch of a BeaconState's fixed section (first `needBytes`) at an exact slot.
 // Streams the gzip'd state from a checkpoint provider and aborts once needBytes are
-// decompressed — ~2.75 MB over the wire instead of the full ~136 MB. Used by the
-// historical_summaries field-proof reconstruction (era-tail fast path) when the era
-// boundary slot is missed and the fixed section can't come from the era file. Returns
-// the fixed section + the state's slot, or null.
+// decompressed.
 export async function fetchFixedSectionAtSlot(
   chainId: number,
   customCheckpointUrls: string[] | undefined,

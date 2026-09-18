@@ -4,7 +4,7 @@
 
 import type { BundleFile } from './content.js'
 
-// Fake stable origin used as the module resolution base inside srcdoc iframes.
+// Stable origin used as the module resolution base inside srcdoc iframes.
 // All bundle file paths are mapped to data: URIs under this origin via importmap.
 export const DAPP_BASE = 'https://dapp.w3fs/'
 

@@ -50,14 +50,14 @@ export interface VerificationResult {
 
 export interface ChainConfig {
   chainId: number
-  consensusRpcs: string[]  // beacon API endpoints tried in order
-  rpcs: string[]           // execution RPC endpoints tried in order
+  consensusRpcs: string[]                 // beacon API endpoints tried in order
+  rpcs: string[]                          // execution RPC endpoints tried in order
   name: string
-  localMode?: boolean                  // use only rpcs[0] at batch 1000, skip era/parquet
-  portalRpc?: string       // optional local Portal Network node (e.g. http://localhost:8545)
-  checkpointUrls?: string[]           // checkpoint sync providers (prepended before built-in defaults)
-  eraFileUrls?: string[]              // era file base URLs (prepended before built-in defaults)
-  parquetUrls?: string[]              // xatu parquet base URLs (prepended before built-in defaults)
+  localMode?: boolean                     // use only rpcs[0] at batch 1000, skip era/parquet
+  portalRpc?: string                      // optional local Portal Network node (e.g. http://localhost:8545)
+  checkpointUrls?: string[]               // checkpoint sync providers (prepended before built-in defaults)
+  eraFileUrls?: string[]                  // era file base URLs (prepended before built-in defaults)
+  parquetUrls?: string[]                  // xatu parquet base URLs (prepended before built-in defaults)
   rpcBatchSizes?: Record<string, number>  // max JSON-RPC batch size per execution RPC URL
   // The inactive RPC set, preserved across the local-mode toggle: when local mode is on
   // these hold the public RPCs (and vice-versa), so editing the active set never touches
@@ -74,12 +74,11 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
       'https://ethereum-beacon-api.publicnode.com',
       'https://lodestar-mainnet.chainsafe.io',
     ],
-    // Every entry is verified to serve what Helios needs: eth_call and
+    // Public gateways need to serve what Helios requires: eth_call and
     // eth_getProof at recent (finalized) blocks, plus JSON-RPC batching. Many
     // public RPCs answer eth_call fine but reject eth_getProof outside the last
     // ~128 blocks (-32602), which breaks Helios silently — so they are excluded.
-    // cloudflare-eth.com was removed entirely: the public gateway is retired and
-    // now answers every call with -32046 "Cannot fulfill request".
+
     rpcs: [
       'https://ethereum-rpc.publicnode.com',
       'https://eth.drpc.org',
@@ -134,6 +133,28 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     ],
     parquetUrls: [
       'https://data.ethpandaops.io/xatu/sepolia/databases/default/canonical_beacon_block',
+    ],
+  },
+  560048: {
+    chainId: 560048,
+    name: 'Hoodi',
+    consensusRpcs: [
+      'https://ethereum-hoodi-beacon-api.publicnode.com',
+      'https://beacon.hoodi.ethpandaops.io',
+    ],
+    rpcs: [
+      'https://ethereum-hoodi-rpc.publicnode.com',
+      'https://hoodi.drpc.org',
+    ],
+    rpcBatchSizes: {
+      'https://ethereum-hoodi-rpc.publicnode.com': 200,
+      'https://hoodi.drpc.org': 200,
+    },
+    checkpointUrls: [
+      'https://beacon.hoodi.ethpandaops.io',
+    ],
+    eraFileUrls: [
+      'https://hoodi.era.nimbus.team',
     ],
   },
 }
@@ -199,8 +220,8 @@ export interface VerificationUpdate {
   type: 'verification-update'
   heliosBacked: boolean
   trieVerified: boolean
-  localMode?: boolean        // local execution RPC, no beacon proof
-  portalVerified?: boolean   // verified via local Portal Network node
+  localMode?: boolean               // local execution RPC, no beacon proof
+  portalVerified?: boolean          // verified via local Portal Network node
   beaconVerified?: boolean
   beaconHeliosAnchored?: boolean    // parentBeaconBlockRoot anchor resolved
   beaconEraVerified?: boolean       // historical_summaries era cross-check passed

@@ -4,19 +4,15 @@ import type { ChainConfig, EraSource, StateSource, ForceMode, HistSource } from 
 const chainsEl           = document.getElementById('chains') as HTMLDivElement
 const toast              = document.getElementById('saved-toast') as HTMLDivElement
 const urlPermBanner      = document.getElementById('url-permission-banner') as HTMLDivElement
-const addBtn          = document.getElementById('add-chain-btn') as HTMLButtonElement
-const addToggle       = document.getElementById('add-chain-toggle') as HTMLButtonElement
-const addChainEl      = document.getElementById('add-chain') as HTMLDivElement
-const newId           = document.getElementById('new-chain-id') as HTMLInputElement
-const newName         = document.getElementById('new-chain-name') as HTMLInputElement
 const defaultChainSel = document.getElementById('default-chain-select') as HTMLSelectElement
 const clearCacheBtn   = document.getElementById('clear-cache-btn') as HTMLButtonElement
 const cacheInfo       = document.getElementById('cache-info') as HTMLSpanElement
 
 // "Helios reads" switch — ON means dApp runtime reads go through Helios (verified, slow);
 // OFF means they're served from the fast RPC (trusted, fast — needed by read-heavy dApps).
-// Backed by the session-scoped `trustedReads` flag (its inverse), so it resets to the safe
-// verified default (Helios ON) on browser restart. Content is always Helios-verified at load.
+// Backed by the session-scoped `trustedReads` flag (its inverse), so it resets to the
+// default (trusted reads — Helios OFF) on browser restart. Content is always Helios-verified
+// at load regardless; this switch only affects the dApp's runtime reads.
 const heliosReadsSwitch = document.getElementById('helios-reads') as HTMLInputElement
 // Default is trusted RPC (Helios reads OFF) for max dApp compatibility — the switch is on
 // only when the user has explicitly enabled Helios-verified reads (trustedReads === false).
@@ -196,11 +192,6 @@ async function updatePermissionBanners() {
 }
 
 updatePermissionBanners()
-
-addToggle.addEventListener('click', () => {
-  addChainEl.classList.toggle('hidden')
-  addToggle.textContent = addChainEl.classList.contains('hidden') ? '+' : '×'
-})
 
 let chains: Record<number, ChainConfig> = {}
 
@@ -393,9 +384,13 @@ function buildCard(chain: ChainConfig): HTMLElement {
       consensusRpcs: rpcValues(consensusList),
       rpcs: execUrls,
       ...(Object.keys(batchSizes).length > 0 ? { rpcBatchSizes: batchSizes } : { rpcBatchSizes: undefined }),
-      ...(cpUrls.length > 0 ? { checkpointUrls: cpUrls } : { checkpointUrls: undefined }),
-      ...(eraUrls.length > 0 ? { eraFileUrls: eraUrls } : { eraFileUrls: undefined }),
-      ...(parquetUrls.length > 0 ? { parquetUrls } : { parquetUrls: undefined }),
+      // Store the collected list verbatim, INCLUDING an empty []: the downloaders read
+      // [] as "explicitly disabled" and undefined as "use built-in defaults". Collapsing
+      // empty → undefined would silently re-enable the nimbus/xatu/checkpoint defaults
+      // after the user cleared the list. Reset (below) restores defaults deliberately.
+      checkpointUrls: cpUrls,
+      eraFileUrls: eraUrls,
+      parquetUrls,
       ...(portalVal ? { portalRpc: portalVal } : { portalRpc: undefined }),
     }
     saveQuiet()
@@ -506,23 +501,6 @@ function rpcValues(container: HTMLElement): string[] {
     .map((i) => i.value.trim())
     .filter(Boolean)
 }
-
-addBtn.addEventListener('click', () => {
-  const id = parseInt(newId.value)
-  const name = newName.value.trim()
-  if (!id || !name) return
-  newId.value = ''
-  newName.value = ''
-  addChainEl.classList.add('hidden')
-  addToggle.textContent = '+'
-  if (chains[id]) {
-    defaultChainSel.value = String(id)
-    render()
-    return
-  }
-  chains[id] = { chainId: id, name, consensusRpcs: [], rpcs: [] }
-  save(id)
-})
 
 // Save + re-render — use for structural changes (add/delete chain, reset, drag-reorder)
 function save(selectChainId?: number) {

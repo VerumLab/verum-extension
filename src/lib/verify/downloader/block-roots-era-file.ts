@@ -13,10 +13,11 @@ const ERA_SERVERS: Record<number, { baseUrl: string; network: string }[]> = {
   1:        [{ baseUrl: 'https://mainnet.era.nimbus.team', network: 'mainnet' }],
   11155111: [{ baseUrl: 'https://sepolia.era.nimbus.team', network: 'sepolia' }],
   17000:    [{ baseUrl: 'https://holesky.era.nimbus.team', network: 'holesky' }],
+  560048:   [{ baseUrl: 'https://hoodi.era.nimbus.team', network: 'hoodi' }],
 }
 
 const CHAIN_NETWORK: Record<number, string> = {
-  1: 'mainnet', 11155111: 'sepolia', 17000: 'holesky',
+  1: 'mainnet', 11155111: 'sepolia', 17000: 'holesky', 560048: 'hoodi',
 }
 // Tail fetch: covers the full BlockIndex record (≤8192*8+24 = 65,560 B) + state entry header (8 B).
 const ERA_TAIL_FETCH  = 70_000
@@ -202,7 +203,7 @@ export async function fetchEraBlockRootsFromEraFile(
 async function tryEraUrl(
   url: string, era: number, expectedBlockSummaryRoot: string,
 ): Promise<Uint8Array[] | null> {
-  // ── Step 1: tail fetch to locate state entry ────────────────────────────────
+  // ── Step 1: tail fetch to locate state entry
   // Era file layout: [Version][Blocks era N-1][BeaconState][BlockIndex era N-1][StateRef era N]
   // The LAST record is a 1-entry index (type 0x3269, count=1) whose single offset points
   // to the BeaconState.  All offsets use the convention:
@@ -236,7 +237,7 @@ async function tryEraUrl(
   }
   console.log(`[w3] Era ${era}: count=${count} stateHeaderAbsPos=${stateHeaderAbsPos}`)
 
-  // ── Step 2: fetch state entry (header + compressed data) ─────────────────────
+  // ── Step 2: fetch state entry (header + compressed data) 
   const fetchEnd = Math.min(stateHeaderAbsPos + ERA_STATE_FETCH - 1, fileSize - 1)
   console.log(`[w3] Era ${era}: state fetch bytes ${stateHeaderAbsPos}–${fetchEnd}`)
   const sf = await eraFetch(url, `bytes=${stateHeaderAbsPos}-${fetchEnd}`, 120_000)
@@ -255,7 +256,7 @@ async function tryEraUrl(
   const stateData    = stateBuf.subarray(8)
   console.log(`[w3] Era ${era}: state compressed=${stateDataLen}B fetched ${stateData.length}B`)
 
-  // ── Step 3: decompress and extract block_roots ───────────────────────────────
+  // ── Step 3: decompress and extract block_roots
   const need = BLOCK_ROOTS_SSZ_OFFSET + BLOCK_ROOTS_SSZ_LEN  // 262320 bytes
 
   const isFramed = stateData.length >= 6 &&
@@ -364,7 +365,7 @@ function snappyResync(data: Uint8Array, n = 4): number {
 // per era boundary since Capella). Lets us size the blob from the era number alone,
 // so the FRONT read only needs block_roots (~700 KB) instead of the full 2.74 MB fixed
 // section. A wrong count yields a wrong leaf 27 → fails the field-proof/Helios check.
-const CAPELLA_ERA: Record<number, number> = { 1: 758, 11155111: 222, 17000: 0 }
+const CAPELLA_ERA: Record<number, number> = { 1: 758, 11155111: 222, 17000: 0, 560048: 0 }
 // Compressed suffix fetched from the end of the state — must reach back (in compressed
 // space) past historical_summaries. hs + the pending_* lists after it are only a few MB
 // today; 32 MB compressed leaves generous headroom for pending-list growth.
@@ -379,9 +380,6 @@ const HS_TAIL_KEEP = 24_000_000
  * downloading the full multi-hundred-MB state — just a small FRONT read (block_roots, to fix
  * the tail alignment) and a ~20MB TAIL suffix. Returns null on any failure so the caller can
  * fall back to the full-state download.
- *
- * NOT self-verifying on its own — the returned blob must still be anchored via the
- * historical_summaries field proof against a Helios-verified state_root.
  */
 export async function fetchHistoricalSummariesFromEraFile(
   era: number, chainId: number, customEraUrls?: string[],

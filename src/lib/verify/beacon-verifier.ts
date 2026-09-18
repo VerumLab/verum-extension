@@ -5,7 +5,7 @@
 // era file) and the BeaconState download live in ./downloader/ — this file keeps
 // the header/body/Helios-anchor fetchers and the verifyViaBeacon orchestrator that
 // ties them all together. Primitives shared with the downloaders live in
-// ./beacon-primitives.ts, avoiding a circular import between this file and them.
+// ./beacon-primitives.ts, avoiding a circular import between files.
 
 import { sha256, getBytes, hexlify } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
@@ -15,9 +15,9 @@ import { computeBeaconBlockBodyRoot, computeBlindedBeaconBlockBodyRoot, verifyHi
   isGloasSlot } from './ssz-state-verifier.js'
 import { timestampToSlot, slotToTimestamp, sszMerkleize, readU32LE, fetchWithTimeout } from './beacon-primitives.js'
 import { getBlockSummaryRoot, fetchFixedSectionAtSlot } from './downloader/beacon-state.js'
-import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from './downloader/era-exec-headers.js'
-import { fetchEraBlockRootsFromParquet } from './downloader/era-parquet.js'
-import { fetchEraBlockRootsFromEraFile, fetchHistoricalSummariesFromEraFile } from './downloader/era-file.js'
+import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from './downloader/block-roots-exec-headers.js'
+import { fetchEraBlockRootsFromParquet } from './downloader/block-roots-parquet.js'
+import { fetchEraBlockRootsFromEraFile, fetchHistoricalSummariesFromEraFile } from './downloader/block-roots-era-file.js'
 
 export { timestampToSlot, slotToTimestamp, fetchWithTimeout } from './beacon-primitives.js'
 
@@ -29,6 +29,7 @@ const CAPELLA_ERA: Record<number, number> = {
   1:        758,   // mainnet CAPELLA_FORK_EPOCH 194048 / 256
   11155111: 222,   // sepolia CAPELLA_FORK_EPOCH 56832 / 256
   17000:    1,     // holesky CAPELLA_FORK_EPOCH 256 / 256
+  560048:   0,     // hoodi — Capella active from genesis
 }
 
 // Exported (alongside merkleProof/merkleVerify/beaconHeaderRoot/fetchVerifiedBeaconHeader/
@@ -153,8 +154,7 @@ export async function fetchVerifyBeaconBodyHash(
   expectedBodyRoot: string,
   chainId: number,
 ): Promise<string> {
-  // Gloas (ePBS) blinded bodies aren't ported; skip straight to the full-SSZ path
-  // for post-Gloas slots (the blinded path would fail closed and fall back anyway).
+  // Glamsterdam (ePBS) blinded bodies aren't ported; skip straight to the full-SSZ path.
   const gloas = isGloasSlot(chainId, slot)
   let blindedErr = ''
   if (!gloas) {
@@ -244,8 +244,6 @@ async function getAnchorStateRoot(
 // until we find the first non-missed slot, then verify its parentBeaconBlockRoot equals
 // effectiveBeaconRoot. Missed beacon slots have no execution block so the ring buffer
 // has no entry for their timestamp — the contract reverts, and we skip to the next slot.
-// The first non-missed slot's parentBeaconBlockRoot is always effectiveBeaconRoot because
-// effectiveSlot itself is not missed (we fetched its beacon header to compute it).
 async function confirmWithHelios(
   heliosRpc: IVerifiedRpc,
   effectiveBeaconRoot: string,
@@ -554,12 +552,19 @@ export async function verifyViaBeacon(
     const primaryHsIndex = historicalSummariesIndex(primary.era, chainId)
 
     // Fast path: era-tail historical_summaries + LC-branch reconstruction (~23 MB, seconds)
-    // instead of the full ~136 MB / 60 s-hash state download. Fails closed → full download.
+    // instead of the full ~136 MB / 60 s-hash state download. Fails result in full download.
     // Dev mode: histSource='full-state' skips era-tail; 'era-tail' forces it and does NOT
-    // fall back (so a failure is visible instead of masked by the full download).
+    // fall back.
     // Gloas: the era-tail reconstruction uses the pre-Gloas (binary) field tree, so it
     // can't rebuild a progressive-container state root — skip it and use the full-state path.
+    // Era files disabled ([]): the era-tail needs an era file for the historical_summaries
+    // blob, so skip straight to full-state rather than logging a misleading "not published".
+    const eraFilesDisabled = options?.eraFileUrls?.length === 0
     const wantEraTail = options?.histSource !== 'full-state' && !isGloasSlot(chainId, anchor.slot)
+      && !eraFilesDisabled
+    // Only historical_summaries falls back to the full-state download here; block_roots
+    // still come from parquet/exec-headers per their own strategy selection below.
+    if (eraFilesDisabled) console.log('[w3] era-tail skipped — era files disabled; historical_summaries via full-state download')
     const [eraTail, primaryRange] = await Promise.all([
       wantEraTail ? tryEraTailStateSummary(consensusRpcs, chainId, anchor.slot, options?.checkpointUrls, options?.eraFileUrls) : Promise.resolve(null),
       findEraBlockRange(execRpcs, primary.era * 8192, chainId),

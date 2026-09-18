@@ -70,7 +70,11 @@ function tryConnect(id: string): Promise<chrome.runtime.Port | null> {
 
     let settled = false
     const settle = (v: chrome.runtime.Port | null) => { if (!settled) { settled = true; resolve(v) } }
-    const timer = setTimeout(() => settle(null), 500)
+    // An installed wallet's MV3 service worker may be asleep: the connect() above wakes it,
+    // but the ping response can lag ~1s on a cold start. A short timeout would report the
+    // wallet as absent ("get MetaMask" while installed). An absent wallet is unaffected — it
+    // fires onDisconnect immediately — so this only lengthens the wait for a waking wallet.
+    const timer = setTimeout(() => settle(null), 1500)
     port.onDisconnect.addListener(() => { void chrome.runtime.lastError; clearTimeout(timer); settle(null) })
     port.onMessage.addListener((raw: unknown) => {
       const msg = raw as { name?: string; data?: { id?: number } }
@@ -105,7 +109,13 @@ function detectAll(): Promise<DetectedWallet[]> {
 // Returns every installed wallet that speaks this protocol.
 export async function listWallets(): Promise<Array<{ name: string; id: string }>> {
   detectedCache = null
-  const wallets = await detectAll()
+  let wallets = await detectAll()
+  // Retry once if nothing was found: the first probe's connect() wakes a sleeping wallet
+  // service worker, so a second pass a moment later catches one that missed the first window.
+  if (wallets.length === 0) {
+    detectedCache = null
+    wallets = await detectAll()
+  }
   return wallets.map(w => ({ name: w.name, id: w.id }))
 }
 

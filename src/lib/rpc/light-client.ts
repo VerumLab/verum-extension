@@ -10,13 +10,9 @@ export interface IVerifiedRpc {
 // Helios RPC fetch proxy — execution AND consensus.
 // Helios calls fetch() internally for all RPC requests. We intercept those
 // calls via sentinel URLs and round-robin them across all configured providers
-// with per-request failover:
+// with per-tt failover:
 //   w3-exec-{chainId}-{idx}.invalid — execution JSON-RPC (POST to base URL)
 //   w3-cons-{chainId}-{idx}.invalid — consensus beacon REST (path appended)
-// Consensus failover matters most: the OOS "N seconds behind" lag is head
-// timestamp vs wall clock, and the head only advances via light-client
-// optimistic updates from the consensus RPC. A single stale/rate-limited
-// consensus provider freezes the head no matter how healthy the exec RPCs are.
 // Light-client updates are sync-committee-signed, so mixing consensus
 // providers per-request is safe — Helios verifies every response.
 // ---------------------------------------------------------------------------
@@ -24,17 +20,13 @@ const _proxyRpcs       = new Map<string, string[]>()  // sentinel key → rpcs
 const _proxyIdx        = new Map<string, number>()    // sentinel key → round-robin counter
 const _proxyBlacklist  = new Map<string, Set<string>>() // sentinel key → permanently broken RPCs
 
-// Diagnostic: tally exec JSON-RPC sub-requests (method → count, total ms) that Helios's
-// WASM fires through the proxy, and flush a compact summary every 2s of activity. Reveals
-// whether one eth_call spawns a batched createAccessList+getProof or thousands of serial
-// getProofs — the difference between "slow but fixable" and "fundamentally serial".
-// Proxy-level cache for deterministic exec reads. Helios re-verifies every proof/code
+// Proxy-level cache for immutable exec reads. Helios re-verifies every response
 // against the trusted state root, so caching cannot weaken the trust model — it only
-// removes redundant network round-trips. A DEX quoter's mc3-style split/retry re-reads
-// the SAME immutable bytecode and SAME-block pool proofs thousands of times; without
-// this, that floods (and gets rate-limited by) the public RPCs. Keys:
-//   code:<proxyKey>:<address>                      (bytecode is immutable → never expires)
-//   proof:<proxyKey>:<block>:<address>:<slots>     (deterministic at a fixed block number)
+// removes redundant network round-trips. Only position-independent immutable reads are
+// cached; anything derived from mutable state is not. Keys:
+//   code:<proxyKey>:<address>               (bytecode is immutable → never expires)
+//   blkhash:<proxyKey>:<blockHash>:<full>   (a block addressed by hash is immutable)
+// eth_getProof and eth_createAccessList are intentionally NOT cached.
 const _rpcCache = new Map<string, unknown>()
 const _RPC_CACHE_CAP = 40_000
 function rpcCacheSet(key: string, value: unknown) {
@@ -42,21 +34,13 @@ function rpcCacheSet(key: string, value: unknown) {
   _rpcCache.set(key, value)
 }
 
-// ── JSON-RPC request coalescing (eth_getProof, eth_createAccessList) ─────────
-// Helios fires each of these as its own HTTP POST; a DEX quote does hundreds
-// concurrently, flooding (and getting rate-limited by) public RPCs — which is
-// what balloons createAccessList to 8–32s under load. Buffer the concurrent ones
-// per method and send them as ONE JSON-RPC batch POST — same requests, same
-// verification (Helios still gets + verifies each result), just far fewer HTTP
-// round-trips. Any sub-request that errors/looks malformed falls back to a single
-// fetch, so a provider that doesn't batch degrades to the per-request path.
+// ── JSON-RPC request coalescing (eth_getProof, eth_createAccessList)
 interface Pending { req: { id: unknown; method: string; params: unknown[] }; resolve: (r: Response) => void }
 const _batchCfg: Record<string, { max: number; windowMs: number; timeoutMs: number }> = {
   eth_getProof: { max: 30, windowMs: 10, timeoutMs: 10_000 },
   // NB: eth_createAccessList is intentionally NOT batched. Batching clusters its results so
   // many eth-calls enter their next WASM phase at once → concurrent re-entry of the Helios
-  // provider object → "recursive use of an object" panic. It's inherent to batching a result
-  // that makes the WASM *continue* executing, so no resolve-timing tweak fixes it.
+  // provider object reuslt in "recursive use of an object" panic. 
 }
 const _batches = new Map<string, { method: string; items: Pending[]; rpcs: string[]; startIdx: number; timer: ReturnType<typeof setTimeout> | null }>()
 
@@ -123,8 +107,7 @@ async function flushBatch(key: string): Promise<void> {
       if (deferResolve) setTimeout(() => item.resolve(resp), 0)
       else item.resolve(resp)
     } else {
-      // Missing / errored / malformed sub-response → single fetch (its own network I/O is
-      // already macrotask-separated). Don't block the loop; on total failure hand back an
+      // Missing / errored / malformed sub-responses don't block the loop; on total failure hand back an
       // error response so the promise still settles instead of hanging the WASM.
       void singleFallback(rpcs, startIdx, item.req, cfg.timeoutMs).then(
         (r) => item.resolve(r),
@@ -183,16 +166,10 @@ const SLOTS_PER_PERIOD = 32 * 256  // 8192 — one sync-committee period
 // /eth/v1/beacon/light_client/updates?start_period=P&count=N to be exactly the
 // updates for [P, P+N), ascending.
 //
-// Some providers (ethereum-beacon-api.publicnode.com today — and it is currently
-// the only reachable mainnet beacon endpoint) ignore both query parameters and
-// return a large, unordered dump instead: e.g. asking for start_period=1801&count=2
-// yields 211 updates whose periods run [1801, 1582, 1583, …, 1791]. Helios applies
-// 1801, sees 1582 next, and aborts the whole sync with "invalid sync committee
-// period" — Helios never initialises, so every verification mode fails.
-//
+// Some providers ignore both query parameters and
+// return a large, unordered dump instead.
 // Rather than trust the provider, select the updates we asked for, deduplicate by
-// period, and return them in ascending order. A conformant provider is unaffected:
-// its response already satisfies the filter.
+// period, and return them in ascending order. 
 // ---------------------------------------------------------------------------
 async function repairLightClientUpdates(res: Response, path: string): Promise<Response | null> {
   let updates: unknown
@@ -250,7 +227,7 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
   const m = url.match(/^https:\/\/(w3-(?:exec|cons)-\d+-\d+\.invalid)(\/.*)?$/)
   if (m) {
     const proxyKey = m[1]
-    // Consensus REST calls carry meaningful paths (/eth/v1/beacon/…) that must
+    // Consensus REST calls carry paths (/eth/v1/beacon/…) that must
     // be appended to the target base URL; exec JSON-RPC posts to the base URL.
     const path = m[2] && m[2] !== '/' ? m[2] : ''
     const isCons = proxyKey.startsWith('w3-cons')
@@ -298,12 +275,6 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
                 // A block addressed by hash is immutable → cache forever, like bytecode.
                 cache = { key: `blkhash:${proxyKey}:${String(p[0]).toLowerCase()}:${p[1] ? 1 : 0}`, id: j.id, method: 'eth_getBlockByHash' }
               }
-              // NB: eth_createAccessList and eth_getProof are intentionally NOT cached —
-              // measured to get zero hits (a quoter's calls are unique per poll), so caching
-              // only adds overhead. Only immutable reads (code, block-by-hash) are cached.
-              // NB: eth_getProof is deliberately NOT cached — it got zero hits (a quoter's
-              // slot-sets are unique) so there's no benefit, and account/state proofs are
-              // the most correctness-sensitive thing to cache. Only immutable reads above.
             }
           }
         } catch { /* not JSON-RPC — ignore */ }
@@ -312,10 +283,6 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
       // Cache hit → synthesize the JSON-RPC response (Helios still re-verifies it).
       if (cache && _rpcCache.has(cache.key)) {
         proxyTally([`${cache.method}:cached`], 0)
-        // Yield a full macrotask before resolving. A real fetch does network I/O and
-        // fully unwinds the WASM stack; resolving synchronously (microtask only) lets the
-        // WASM continuation re-enter while the original call still holds its borrow →
-        // "recursive use of an object" panic. This defer mimics real async I/O.
         await new Promise((resolve) => setTimeout(resolve, 0))
         const body = JSON.stringify({ jsonrpc: '2.0', id: cache.id, result: _rpcCache.get(cache.key) })
         const resp = new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -325,7 +292,8 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
         return resp
       }
 
-      // Coalesce buffered getProof / createAccessList into batched POSTs (see _batchCfg).
+      // Coalesce batchable methods (currently only eth_getProof; see _batchCfg — note
+      // eth_createAccessList is deliberately excluded) into batched POSTs.
       if (singleReq && _batchCfg[singleReq.method] && Array.isArray(singleReq.params)) {
         return await enqueueBatch(proxyKey, singleReq.method, rpcs, startIdx, singleReq)
       }
@@ -337,7 +305,7 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
         const rpc = rpcs[(startIdx + attempt) % rpcs.length]
 
         const ctrl = new AbortController()
-        // Consensus responses (bootstrap, update batches) can be MBs — allow longer.
+        // Consensus responses (bootstrap, update batches) can be MBs allow longer.
         const timer = setTimeout(() => ctrl.abort(), isCons ? 15_000 : 5_000)
         const host = new URL(rpc).hostname
         try {
@@ -350,8 +318,6 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
             if (attempt < rpcs.length - 1) continue
             return res
           }
-          // Consensus REST responses are not JSON-RPC — no error body to inspect,
-          // but the light-client updates endpoint needs repairing on some providers.
           if (isCons) {
             if (path.startsWith('/eth/v1/beacon/light_client/updates')) {
               const repaired = await repairLightClientUpdates(res, path)
@@ -361,16 +327,9 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
             }
             return res
           }
-          // Peek at JSON-RPC envelope validity + errors in 200 responses.
           // Malformed/non-JSON bodies and responses missing both result and error
-          // (some CDN edges and rate-limiters return HTML or truncated bodies with
-          // a 200 status) are never handed to Helios, even as a last resort —
-          // feeding its WASM deserializer input it doesn't expect can panic the
-          // whole instance instead of throwing a catchable error (confirmed via
-          // crash dump: EXC_BREAKPOINT trap inside JIT-compiled WASM on the SW
-          // thread). Known error codes below get failed over too — Helios
-          // interprets them as "execution RPC broken" and applies backoff for
-          // them. Legitimate eth_call reverts (code 3) are returned as-is.
+          // are never handed to Helios. Known error codes below get failed over too 
+          // Legitimate eth_call reverts (code 3) are returned as-is.
           const clone = res.clone()
           let json: { result?: unknown; error?: { code?: number; message?: string } } | undefined
           try {
@@ -384,21 +343,10 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
           if (json.error) {
             const msg = json.error.message ?? ''
             const isUnsupported = json.error.code === -32601
-            // A genuine contract revert is a real answer — the provider did its
-            // job and Helios must see it. Geth-family nodes report reverts as
-            // code 3. Everything else (rate limits, -32000 exec failures, -32603
-            // internal errors, -32046 "cannot fulfill request" from the retired
-            // Cloudflare gateway, and any code we haven't seen yet) means THIS
-            // provider could not serve the request — so try the next one.
-            //
-            // Enumerating broken codes was the wrong default: an unlisted code
-            // fell through to Helios, which reads any execution error as "RPC
-            // broken" and enters a ~60s backoff, stalling sync entirely.
-            // Tenderly's code 3 "intrinsic gas too high" is a validation failure
-            // dressed up as a revert, so it's excluded from the revert case.
+            // A genuine contract revert is a real answer.
             const isRevert = json.error.code === 3 && !/intrinsic gas too high/i.test(msg)
             if (isUnsupported) {
-              // Provider permanently doesn't support this method — blacklist it
+              // Provider permanently doesn't support this method, blacklist
               // so it's never routed to again for this Helios instance.
               if (!_proxyBlacklist.has(proxyKey)) _proxyBlacklist.set(proxyKey, new Set())
               _proxyBlacklist.get(proxyKey)!.add(rpc)
@@ -465,12 +413,21 @@ export class RpcClient implements IVerifiedRpc {
 
 // Try Helios WASM — a single instance whose execution AND consensus traffic
 // both go through the failover proxy. No more racing one WASM per consensus
-// candidate: per-request consensus failover inside the proxy replaces it and
-// halves the startup load. Throws if init fails — callers must not fall back
-// to an unverified RPC.
+// candidate: per-request consensus failover inside the proxy halves the startup load. 
+// Throws if init fails. Callers must not fall back to an unverified RPC.
 export async function createVerifiedRpc(chain: ChainConfig, forceFresh = false): Promise<IVerifiedRpc> {
-  const network = heliosNetwork(chain.chainId)
-  console.log(`[w3] Helios proxy: ${chain.rpcs.length} exec + ${chain.consensusRpcs.length} consensus RPCs for chainId ${chain.chainId}`)
+  const network = heliosNetwork(chain)
+  if (!network) {
+    // No silent mainnet fallback: booting Helios with the wrong consensus preset can't
+    // verify the chain (sync just fails against a mismatched genesis/fork schedule). Fail
+    // loudly so the caller can offer local/trusted mode instead of a doomed Helios sync.
+    throw new Error(
+      `Helios verification is unavailable for chain ${chain.chainId}: not a Helios-supported ` +
+      `network (${[...new Set(Object.values(HELIOS_NETWORK_BY_CHAIN))].join(', ')}). ` +
+      `Use local-node or trusted-reads mode.`,
+    )
+  }
+  console.log(`[w3] Helios proxy (${network}): ${chain.rpcs.length} exec + ${chain.consensusRpcs.length} consensus RPCs for chainId ${chain.chainId}`)
 
   const execKey = `w3-exec-${chain.chainId}-0.invalid`
   const consKey = `w3-cons-${chain.chainId}-0.invalid`
@@ -487,11 +444,21 @@ export async function createVerifiedRpc(chain: ChainConfig, forceFresh = false):
   }
 }
 
-function heliosNetwork(chainId: number) {
-  const map: Record<number, string> = {
-    1:        'mainnet',
-    11155111: 'sepolia',
-    17000:    'holesky',
-  }
-  return (map[chainId] ?? 'mainnet') as Parameters<typeof HeliosWasmClient.create>[0]
+type HeliosNet = Parameters<typeof HeliosWasmClient.create>[0]
+
+// chainId → Helios consensus preset, for the ethereum-kind networks Helios ships. Verum wires
+// Helios through a consensus-beacon proxy, which only fits Helios's "ethereum" NetworkKind — its
+// opstack and linea kinds use a different config (verifiableApi / no consensus RPC) and aren't
+// wired here, so verification is limited to these networks.
+const HELIOS_NETWORK_BY_CHAIN: Record<number, HeliosNet> = {
+  1:        'mainnet',
+  17000:    'holesky',
+  560048:   'hoodi',
+  11155111: 'sepolia',
+}
+
+// Resolves the Helios preset for a chain, or undefined when Helios can't verify it — so
+// createVerifiedRpc surfaces a clear error instead of silently syncing against the wrong network.
+function heliosNetwork(chain: ChainConfig): HeliosNet | undefined {
+  return HELIOS_NETWORK_BY_CHAIN[chain.chainId]
 }

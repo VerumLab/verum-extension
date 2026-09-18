@@ -90,7 +90,7 @@ const ensValue = JSON.stringify(coords)
 const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
 
 console.error('\n─────────────────────────────────────────')
-console.error('ENS record value (copy to set-ens.js):')
+console.error('Name record value (copy to set-name.js):')
 console.error(ensValue)
 console.error('')
 console.error('─────────────────────────────────────────')

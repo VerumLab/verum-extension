@@ -63,7 +63,7 @@ function setPhase(phase: Phase) {
     verifyBadge.className = 'syncing'
     verifyIcon.textContent = '⟳'
     verifyLabel.textContent = 'Verifying…'
-    const contentLabel = renderMode === 'raw' ? 'file' : 'dApp'
+    const contentLabel = renderMode === 'raw' ? 'file' : 'website'
     unverifiedModalMsg.textContent = `This ${contentLabel} is still being verified. Content authenticity is not yet confirmed.`
     unverifiedGate.classList.toggle('hidden', !pageHasScripts && renderMode !== 'raw')
     unverifiedModal.classList.add('hidden')
@@ -824,7 +824,7 @@ function applyVerification(msg: VerificationUpdate) {
     verifyLabel.textContent = 'Unverified — RPC trusted without proof'
     warningText.textContent = 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'
     showWarning()
-    const contentLabel = renderMode === 'raw' ? 'file' : 'dApp'
+    const contentLabel = renderMode === 'raw' ? 'file' : 'website'
     unverifiedModalMsg.textContent = `This ${contentLabel} could not be verified against the blockchain. Its content may have been tampered with. Continue at your own risk.`
   }
 }

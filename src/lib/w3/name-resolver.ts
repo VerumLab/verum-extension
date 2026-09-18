@@ -1,16 +1,10 @@
-// ENS (.eth) and GNS (.gwei) name resolution for w3:// URLs.
+// ENS (.eth), WNS (.wei) and GNS (.gwei) name resolution for w3:// URLs.
 //
-// Record layout (set via ENS app / scripts/set-ens.js, or scripts/set-gns.js):
+// Record layout (set via the name app or scripts/set-name.js):
 //   text record "w3" = JSON array: [[blockNumber, txIndex], ...]
 //
-// The chain is determined by the URL's trailing suffix, e.g. w3://myapp.eth:11155111
-// uses Sepolia ENS. Chain ID is NOT stored in the record.
-//
-// GNS (https://github.com/lucadonnoh/gwei-names) is a separate, ownerless
-// name service for .gwei names. It uses the same EIP-137 namehash algorithm
-// and the same ENS-compatible text(bytes32,string) resolver selector as ENS,
-// but its NameNFT contract acts as both registry and resolver — there's no
-// registry.resolver(node) indirection to do first.
+// The chain is determined by the URL's traifix, eling suf.g. w3://myapp.eth:11155111
+// uses that chains (Sepolia) ENS/WNS/GNS. Chain ID is NOT stored in the record.
 
 import { keccak256, concat, getBytes, toUtf8Bytes, hexlify, type BytesLike } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
@@ -20,12 +14,6 @@ const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e'
 
 // NameNFT contract — same address on mainnet and Sepolia
 const GNS_REGISTRY = '0x9D51D507BC7264d4fE8Ad1cf7Fe191933A0a81d6'
-
-// WNS (.wei) name service — Ethereum mainnet. Like GNS, the registry contract is
-// itself the resolver (no registry.resolver(node) hop), and it answers the standard
-// ENS resolver interface: text(bytes32,string), addr(bytes32), and the ERC-6821
-// `contentcontract` record. .wei names point at a contract (zSwap-style), so they
-// carry no `w3` record — resolveName falls through to the contract-served path.
 const WNS_REGISTRY = '0x0000000000696760E15f265e828DB644A0c242EB'
 
 export interface TxRef {
@@ -184,7 +172,7 @@ function parseContentContract(raw: string): ContractResolution | null {
 // Main resolver
 // ---------------------------------------------------------------------------
 
-// ENS/GNS re-verification: after phase 1 resolves a name via a plain RPC, the name is
+// ENS/WNS/GNS re-verification: after phase 1 resolves a name via a plain RPC, the name is
 // re-resolved through Helios (trustless, at `finalized`) and the two chunk lists compared.
 // Returns true if Helios confirms the same chunks, false if it resolves to definitively
 // different non-empty chunks (possible forgery), undefined if Helios couldn't resolve
@@ -248,7 +236,7 @@ export async function resolveEns(
 // `contentcontract` (or the addr record) → a contract-served page (5219/8244).
 //
 // This is the dispatch a w3:// name goes through: existing verum names keep hitting
-// the `w3` branch untouched; .wei / contract-served names fall through to `contract`.
+// the `w3` branch untouched; contract-served names fall through to `contract`.
 // ---------------------------------------------------------------------------
 
 export type NameResolution =

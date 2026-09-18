@@ -1,92 +1,143 @@
 #!/usr/bin/env node
-// Set ENS text records so w3://<name>.eth resolves to your calldata.
+// Set the "w3" text record on a name so w3://<name> resolves to your calldata.
+//
+// One script for every name service verum resolves:
+//   .eth   → ENS  (registry/resolver split, NameWrapper & BaseRegistrar auth)
+//   .gwei  → GNS  (https://gwei.domains) — NameNFT is registry+resolver in one
+//   .wei   → WNS  (https://wei.domains)  — NameNFT is registry+resolver in one
+//
+// GNS and WNS share the same NameNFT interface: a plain ERC-721 whose
+// setText(uint256 tokenId, …) just checks ownerOf(). Only ENS needs the
+// registry.resolver(node) hop and the wrapper/registrar dance.
 //
 // Usage:
-//   node scripts/set-ens.js <ens-name> <rpc-url> <private-key> <ref> [<ref2> ...]
+//   node scripts/set-name.js [--resolver <addr>] <name> <rpc-url> <private-key> <ref> [<ref2> ...]
+//   node scripts/publish.js < bundle.hex | node scripts/set-name.js <name> <rpc-url> <private-key>
 //
 // Each <ref> is coordinates "blockNum:idx", used directly — no lookup needed.
-//
 // Writes the compact format: [[blockNumber, txIndex], ...]
 //
+// The --resolver <addr> flag applies to ENS only (override the resolver used for
+// setText when the auto-detected one has an incompatible NameWrapper reference).
+//
 // Prerequisites:
-//   - You own the ENS name (or have approval to set text records)
-//   - The resolver must support the setText() interface (PublicResolver does)
+//   - You own the name (.eth via ENS; .gwei via gwei.domains; .wei via wei.domains)
+//   - For .eth, the resolver must support setText() (PublicResolver does)
 
 import { ethers } from 'ethers'
 
-// Optional --resolver <addr> flag: override the resolver used for setText.
-// Useful when the auto-detected resolver has an incompatible NameWrapper reference.
-let resolverOverride = null
+// --- Parse args (pull the ENS-only --resolver flag out first) ---
 const rawArgs = process.argv.slice(2)
+let resolverOverride = null
 const resolverFlagIdx = rawArgs.indexOf('--resolver')
 if (resolverFlagIdx !== -1) {
   resolverOverride = rawArgs[resolverFlagIdx + 1]
   rawArgs.splice(resolverFlagIdx, 2)
 }
 
-const [ensName, rpcUrl, privateKey, ...rest] = rawArgs
+const [name, rpcUrl, privateKey, ...rest] = rawArgs
 
-if (!ensName || !rpcUrl || !privateKey) {
+if (!name || !rpcUrl || !privateKey) {
   console.error('Usage:')
-  console.error('  node scripts/set-ens.js [--resolver <addr>] <name> <rpc> <key> <block>:<idx> [...]')
-  console.error('  node scripts/publish.js < bundle.hex | node scripts/set-ens.js <name> <rpc> <key>')
+  console.error('  node scripts/set-name.js [--resolver <addr>] <name> <rpc> <key> <block>:<idx> [...]')
+  console.error('  node scripts/publish.js < bundle.hex | node scripts/set-name.js <name> <rpc> <key>')
   process.exit(1)
 }
 
-// Read refs from args or from stdin (piped from publish.js)
-let refs
-if (rest.length > 0) {
-  refs = rest
-  for (const ref of refs) {
-    if (!/^\d+:\d+$/.test(ref)) {
-      console.error(`Invalid ref (expected <block>:<idx>): ${ref}`); process.exit(1)
+// --- Read refs from args or from stdin (piped from publish.js) ---
+async function readRefs() {
+  if (rest.length > 0) {
+    for (const ref of rest) {
+      if (!/^\d+:\d+$/.test(ref)) {
+        console.error(`Invalid ref (expected <block>:<idx>): ${ref}`); process.exit(1)
+      }
     }
+    return rest
   }
-} else {
   const stdin = []
   for await (const chunk of process.stdin) stdin.push(chunk)
   const raw = Buffer.concat(stdin).toString().trim()
   if (!raw) { console.error('No refs provided and stdin is empty'); process.exit(1) }
   try {
-    const parsed = JSON.parse(raw)
-    refs = parsed.map(([b, i]) => `${b}:${i}`)
+    return JSON.parse(raw).map(([b, i]) => `${b}:${i}`)
   } catch {
     console.error(`Could not parse stdin as JSON array: ${raw}`); process.exit(1)
   }
 }
 
+function browseUrl(chainId, name) {
+  const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
+  return `w3://${chainPrefix}${name}`
+}
+
+// --- Name services whose NameNFT is registry+resolver in one (GNS, WNS) ---
+// tokenId = uint256(namehash(name)); setText(tokenId, …) checks ownerOf().
+const NAME_NFT_ABI = [
+  'function ownerOf(uint256 tokenId) view returns (address)',
+  'function isExpired(uint256 tokenId) view returns (bool)',
+  'function setText(uint256 tokenId, string key, string value)',
+]
+
+const NAME_NFTS = {
+  // GNS (.gwei) — same address on mainnet and Sepolia
+  gwei: { service: 'GNS', address: '0x9D51D507BC7264d4fE8Ad1cf7Fe191933A0a81d6', register: 'https://gwei.domains' },
+  // WNS (.wei) — Ethereum mainnet
+  wei:  { service: 'WNS', address: '0x0000000000696760E15f265e828DB644A0c242EB', register: 'https://wei.domains' },
+}
+
+async function setViaNameNft(cfg, wallet, provider, value) {
+  const chainId = (await provider.getNetwork()).chainId
+  // Token ID = uint256(namehash(name)) — same EIP-137 algorithm ethers.namehash
+  // implements, no service-specific hashing needed.
+  const tokenId = BigInt(ethers.namehash(name))
+  const nft = new ethers.Contract(cfg.address, NAME_NFT_ABI, provider)
+
+  let owner
+  try {
+    owner = await nft.ownerOf(tokenId)
+  } catch {
+    console.error(`"${name}" is not registered. Register it first at ${cfg.register}`)
+    process.exit(1)
+  }
+  if (await nft.isExpired(tokenId)) {
+    console.error(`"${name}" is expired (past its grace period). Register it first at ${cfg.register}`)
+    process.exit(1)
+  }
+  if (owner.toLowerCase() !== wallet.address.toLowerCase()) {
+    console.error(`Not authorized: "${name}" is owned by ${owner}, signer is ${wallet.address}`)
+    process.exit(1)
+  }
+
+  console.log(`\nSetting ${cfg.service} text record "w3" = ${value}`)
+  const tx = await nft.connect(wallet).setText(tokenId, 'w3', value)
+  await tx.wait()
+  console.log(`✓ Done. Browse at: ${browseUrl(chainId, name)}`)
+}
+
+// --- ENS (.eth): registry/resolver split, NameWrapper & BaseRegistrar auth ---
 const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e'
 
 const REGISTRY_ABI = [
   'function resolver(bytes32 node) view returns (address)',
   'function owner(bytes32 node) view returns (address)',
 ]
-
 const RESOLVER_ABI = [
   'function setText(bytes32 node, string key, string value) external',
   'function nameWrapper() view returns (address)',
 ]
-
 const NAMEWRAPPER_ABI = [
   'function ownerOf(uint256 id) view returns (address)',
   'function setResolver(bytes32 node, address resolver) external',
 ]
-
 const BASEREGISTRAR_ABI = [
   'function ownerOf(uint256 tokenId) view returns (address)',
   'function reclaim(uint256 id, address owner) external',
 ]
 
-
-async function main() {
-  const provider = new ethers.JsonRpcProvider(rpcUrl)
-  const wallet = new ethers.Wallet(privateKey, provider)
+async function setViaEns(wallet, provider, value) {
   const chainId = (await provider.getNetwork()).chainId
-
-  const chunks = refs.map((ref) => ref.split(':').map(Number))
-
   const registry = new ethers.Contract(ENS_REGISTRY, REGISTRY_ABI, provider)
-  const node = ethers.namehash(ensName)
+  const node = ethers.namehash(name)
 
   const [registryOwner, resolverAddr] = await Promise.all([
     registry.owner(node),
@@ -94,20 +145,18 @@ async function main() {
   ])
 
   if (resolverAddr === ethers.ZeroAddress) {
-    console.error(`No resolver set for ${ensName}. Set one at app.ens.domains first.`)
+    console.error(`No resolver set for ${name}. Set one at app.ens.domains first.`)
     process.exit(1)
   }
 
-  const value = JSON.stringify(chunks)
-  console.log(`\nSetting text record "w3" = ${value}`)
+  console.log(`\nSetting ENS text record "w3" = ${value}`)
+  const resolver = new ethers.Contract(resolverAddr, RESOLVER_ABI, wallet)
 
   // --- Simple case: signer directly owns the name in the registry ---
   if (registryOwner.toLowerCase() === wallet.address.toLowerCase()) {
-    const resolver = new ethers.Contract(resolverAddr, RESOLVER_ABI, wallet)
     const tx = await resolver.setText(node, 'w3', value)
     await tx.wait()
-    const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
-    console.log(`✓ Done. Browse at: w3://${chainPrefix}${ensName}`)
+    console.log(`✓ Done. Browse at: ${browseUrl(chainId, name)}`)
     return
   }
 
@@ -116,9 +165,6 @@ async function main() {
   // after expiry; the ERC-1155 token burns while the registry entry lingers). Instead, simulate
   // setText via staticCall. If the resolver accepts it, proceed. If not, diagnose from the error.
   console.log(`Registry owner is ${registryOwner} — attempting setText simulation...`)
-
-  const resolver = new ethers.Contract(resolverAddr, RESOLVER_ABI, wallet)
-  // Simulate first to catch auth failures early.
   const simOk = await resolver.setText.staticCall(node, 'w3', value).then(() => true).catch(() => false)
 
   if (!simOk) {
@@ -142,8 +188,7 @@ async function main() {
       const newResolver = new ethers.Contract(resolverOverride, RESOLVER_ABI, wallet)
       const tx2 = await newResolver.setText(node, 'w3', value)
       await tx2.wait()
-      const chainPrefix2 = chainId.toString() === '1' ? '' : `${chainId}:`
-      console.log(`✓ Done. Browse at: w3://${chainPrefix2}${ensName}`)
+      console.log(`✓ Done. Browse at: ${browseUrl(chainId, name)}`)
       return
     }
 
@@ -152,7 +197,7 @@ async function main() {
     // reclaim() updates the registry owner to the wallet address so the old resolver accepts setText.
     const ethNode = ethers.namehash('eth')
     const baseRegistrarAddr = await registry.owner(ethNode)
-    const label = ensName.split('.')[0]
+    const label = name.split('.')[0]
     const labelhash = BigInt(ethers.keccak256(ethers.toUtf8Bytes(label)))
     const baseRegistrar = new ethers.Contract(baseRegistrarAddr, BASEREGISTRAR_ABI, provider)
 
@@ -168,8 +213,7 @@ async function main() {
       // Now registry.owner(node) == wallet.address so the old resolver accepts the call.
       const tx2 = await resolver.setText(node, 'w3', value)
       await tx2.wait()
-      const chainPrefix2 = chainId.toString() === '1' ? '' : `${chainId}:`
-      console.log(`✓ Done. Browse at: w3://${chainPrefix2}${ensName}`)
+      console.log(`✓ Done. Browse at: ${browseUrl(chainId, name)}`)
       return
     }
 
@@ -182,14 +226,34 @@ async function main() {
       `  nameWrapper.ownerOf():  ${nwTokenOwner}\n` +
       `  baseRegistrar:          ${baseRegistrarAddr}\n` +
       `  baseRegistrar.ownerOf(): ${erc721Owner ?? '(failed)'}\n\n` +
-      `Fallback: app.ens.domains → ${ensName} → Edit Records.`
+      `Fallback: app.ens.domains → ${name} → Edit Records.`
     )
   }
 
   const tx = await resolver.setText(node, 'w3', value)
   await tx.wait()
-  const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
-  console.log(`✓ Done. Browse at: w3://${chainPrefix}${ensName}`)
+  console.log(`✓ Done. Browse at: ${browseUrl(chainId, name)}`)
+}
+
+async function main() {
+  const refs = await readRefs()
+  const chunks = refs.map((ref) => ref.split(':').map(Number))
+  const value = JSON.stringify(chunks)
+
+  const provider = new ethers.JsonRpcProvider(rpcUrl)
+  const wallet = new ethers.Wallet(privateKey, provider)
+
+  const lower = name.toLowerCase()
+  const nftKey = Object.keys(NAME_NFTS).find((tld) => lower.endsWith(`.${tld}`))
+  if (resolverOverride && nftKey) {
+    console.error(`--resolver applies to ENS (.eth) names only; ignoring it for .${nftKey}`)
+  }
+
+  if (nftKey) {
+    await setViaNameNft(NAME_NFTS[nftKey], wallet, provider, value)
+  } else {
+    await setViaEns(wallet, provider, value)
+  }
 }
 
 main().catch((err) => { console.error(err.message); process.exit(1) })

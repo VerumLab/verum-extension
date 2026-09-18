@@ -1,6 +1,6 @@
 // Portal History Network calldata retrieval.
 //
-// This client (nimbus_portal_client v0.3.1) uses:
+// Client (nimbus_portal_client) uses:
 //   - Content keys: SSZ union — selector (1 byte) + uint64 LE block number (8 bytes)
 //     - 0x00 = blockBody, 0x01 = receipts  (no header type)
 //   - portal_historyGetContent(contentKey) → {content: rlpHex, utpTransfer: bool}
@@ -8,9 +8,8 @@
 //   - portal_historyGetBlockBody(rlpHeaderHex) → rlpBodyHex (takes full header for verification)
 //
 // The Portal node validates block body against the header's txRoot before storing,
-// so a successful fetch implies the transactions root was already verified — calldata
-// is checked to be part of the tx, the tx part of the block, and the block part of the
-// canonical chain. No additional local trie verification is needed on top of that.
+// a successful fetch means the transactions root was already verified. 
+// No additional local trie verification required.
 
 import { getBytes, hexlify, decodeRlp } from 'ethers'
 
@@ -84,7 +83,7 @@ export async function getCalldataViaPortal(
 ): Promise<{ calldata: Uint8Array; trieVerified: boolean }> {
   const contentKey = blockBodyContentKey(blockNumber)
 
-  // Fetch block body — Portal node validated txRoot before storing
+  // Fetch block body. Portal node validated txRoot before storing
   const resp = await portalRequest<{ content: string }>(
     portalRpcUrl, 'portal_historyGetContent', [contentKey],
   )
@@ -99,6 +98,6 @@ export async function getCalldataViaPortal(
 
   const calldata = extractCalldata(txs[txIndex])
 
-  // Portal already verified trie before storing — mark as verified
+  // Portal already verified trie before storing, mark as verified
   return { calldata, trieVerified: true }
 }

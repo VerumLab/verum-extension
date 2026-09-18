@@ -104,6 +104,7 @@ This Privacy Policy may be updated from time to time. Changes will be reflected 
 If you have questions about this Privacy Policy, you can reach out via:
 
 - GitHub: Open an issue in the repository
+- Email: verumlab@proton.me
 
 ---
 
