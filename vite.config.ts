@@ -16,7 +16,7 @@ export default defineConfig({
         terms: resolve(__dirname, 'src/terms.html'),
         deploy: resolve(__dirname, 'src/deploy.html'),
         background: resolve(__dirname, 'src/background.ts'),
-        'dapp-sandbox':   resolve(__dirname, 'src/dapp-sandbox.html'),
+        'website-sandbox':   resolve(__dirname, 'src/website-sandbox.html'),
       },
       output: {
         entryFileNames: '[name].js',
@@ -29,14 +29,14 @@ export default defineConfig({
   },
   plugins: [
     {
-      // dapp-sandbox.html is a null-origin sandbox page — Vite's default crossorigin=""
+      // website-sandbox.html is a null-origin sandbox page — Vite's default crossorigin=""
       // on module scripts triggers CORS with Origin: null, which fails for extension
       // resources. Strip it (and the modulepreload link) from the built output.
       name: 'strip-sandbox-crossorigin',
       transformIndexHtml: {
         order: 'post',
         handler(html, ctx) {
-          if (!ctx.filename.endsWith('dapp-sandbox.html')) return html
+          if (!ctx.filename.endsWith('website-sandbox.html')) return html
           return html
             .replace(/<link rel="modulepreload"[^>]*>/gi, '')
             .replace(/(<script[^>]*)\s+crossorigin(?:="[^"]*")?/gi, '$1')

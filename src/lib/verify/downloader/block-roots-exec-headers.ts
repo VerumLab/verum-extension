@@ -1,3 +1,4 @@
+import { w3log } from '../../log'
 // Era block_roots via execution headers: fetch ~8192 execution block headers
 // (EIP-4788 parentBeaconBlockRoot), build the block_roots vector, and verify
 // sszMerkleize(roots) == block_summary_root. Slowest of the three era-root
@@ -128,14 +129,14 @@ export async function findEraBlockRange(
   const estimatedOffset = Math.round((anchorTs - startTs) / 12)
   const lo = Math.max(0, anchorNum - estimatedOffset * 2)
 
-  console.log(`[w3] findEraBlockRange: anchorNum=${anchorNum} estimatedOffset=${estimatedOffset} lo=${lo}`)
+  w3log(`[w3] findEraBlockRange: anchorNum=${anchorNum} estimatedOffset=${estimatedOffset} lo=${lo}`)
 
   const [startNum, endNum] = await Promise.all([
     findBlockAtTimestamp(execRpcs, startTs, lo, anchorNum),
     findBlockAtTimestamp(execRpcs, endTs,   lo, anchorNum),
   ])
 
-  console.log(`[w3] Era block range: [${startNum}, ${endNum}) — ${endNum - startNum} blocks`)
+  w3log(`[w3] Era block range: [${startNum}, ${endNum}) — ${endNum - startNum} blocks`)
   return { startNum, endNum }
 }
 
@@ -223,7 +224,7 @@ export async function fetchEraBlockRootsFromExecHeaders(
 
       done++
       if (done % LOG_EVERY === 0 || done === total) {
-        console.log(`[w3] Era ${era}: ${host} ${done}/${total} batches (${Math.round(done / total * 100)}%) inEra=${cntInEra}`)
+        w3log(`[w3] Era ${era}: ${host} ${done}/${total} batches (${Math.round(done / total * 100)}%) inEra=${cntInEra}`)
       }
     }
   }
@@ -237,11 +238,11 @@ export async function fetchEraBlockRootsFromExecHeaders(
     rpc:      execRpcs[i % execRpcs.length],
   }))
 
-  console.log(`[w3] Era ${era}: fetching exec headers ${startNum}–${endNum} (${endNum - startNum} blocks, ${numSegments} segments via ${segments.map(s => new URL(s.rpc).hostname).join(', ')})`)
+  w3log(`[w3] Era ${era}: fetching exec headers ${startNum}–${endNum} (${endNum - startNum} blocks, ${numSegments} segments via ${segments.map(s => new URL(s.rpc).hostname).join(', ')})`)
 
   await Promise.all(segments.map(({ segStart, segEnd, rpc }) => processSegment(segStart, segEnd, rpc)))
 
-  console.log(`[w3] rawRoots[0]=${rawRoots[0] ? hexlify(rawRoots[0]) : 'null'} rawRoots[8191]=${rawRoots[8191] ? hexlify(rawRoots[8191]) : 'null'}`)
+  w3log(`[w3] rawRoots[0]=${rawRoots[0] ? hexlify(rawRoots[0]) : 'null'} rawRoots[8191]=${rawRoots[8191] ? hexlify(rawRoots[8191]) : 'null'}`)
 
   // Backward-fill missed beacon slots: rawRoots[k]=null means slot eraStartSlot+k+1 was missed;
   // correct block_roots[k] = root of last non-missed block at or before that slot = next non-null to the right.
@@ -255,7 +256,7 @@ export async function fetchEraBlockRootsFromExecHeaders(
     seed = nextBlock?.parentBeaconBlockRoot
       ? getBytes(nextBlock.parentBeaconBlockRoot)
       : rawRoots.findLast(r => r !== null) ?? new Uint8Array(32)
-    console.log(`[w3] rawRoots[8191] null — fetched seed from exec block ${endNum}: ${nextBlock?.parentBeaconBlockRoot ?? 'null'}`)
+    w3log(`[w3] rawRoots[8191] null — fetched seed from exec block ${endNum}: ${nextBlock?.parentBeaconBlockRoot ?? 'null'}`)
   }
 
   const roots: Uint8Array[] = new Array(8192)
@@ -266,14 +267,14 @@ export async function fetchEraBlockRootsFromExecHeaders(
   }
 
   const filled = rawRoots.filter(r => r === null).length
-  console.log(`[w3] Era ${era}: ${cntInEra} headers mapped, ${filled}/8192 backward-filled`)
-  console.log(`[w3] roots[0]=${hexlify(roots[0])} roots[8191]=${hexlify(roots[8191])}`)
+  w3log(`[w3] Era ${era}: ${cntInEra} headers mapped, ${filled}/8192 backward-filled`)
+  w3log(`[w3] roots[0]=${hexlify(roots[0])} roots[8191]=${hexlify(roots[8191])}`)
 
   const computed = computeEraBlockSummaryRoot(roots)
   if (computed.toLowerCase() !== expectedBlockSummaryRoot.toLowerCase())
     throw new Error(
       `Era ${era}: computed block_summary_root ${computed} ≠ historical_summaries value ${expectedBlockSummaryRoot}`,
     )
-  console.log(`[w3] Era ${era}: block_roots Merkle root verified against historical_summaries ✓`)
+  w3log(`[w3] Era ${era}: block_roots Merkle root verified against historical_summaries ✓`)
   return roots
 }

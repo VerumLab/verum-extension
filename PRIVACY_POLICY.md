@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last Updated:** September 3, 2026
+**Last Updated:** September 21, 2026
 
 Verum ("the Extension") is a Chrome browser extension that browses `w3://` dapps whose data is stored on the Ethereum blockchain and cryptographically verifies it locally with the Helios light client. This Privacy Policy explains how the Extension handles your information.
 

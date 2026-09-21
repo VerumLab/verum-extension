@@ -65,7 +65,6 @@ html, body {
   display: flex; align-items: center; gap: 12px;
   width: 360px; max-width: 100%; justify-content: space-between;
 }
-#rocket-game .rg-hint { color: var(--text-muted); font-size: 12px; }
 #rocket-game .rg-restart {
   background: var(--surface); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
@@ -120,25 +119,25 @@ html, body {
 }
 #warning-dismiss:hover { background: rgba(185,28,28,0.5); }
 
-/* ---- Dapp host — div is the fixed viewport element, iframe is block child ----
+/* ---- Website host — div is the fixed viewport element, iframe is block child ----
    A directly-fixed OOP (sandboxed) iframe bypasses the CSS viewport clip when
    DevTools resizes the page. Wrapping in a regular div makes the div own the
    fixed position; the iframe fills it as a normal block child and is clipped
    correctly by the div's overflow. */
-#dapp-host {
+#website-host {
   position: fixed; inset: 0;
   overflow: hidden;
   visibility: hidden;
   pointer-events: none;
 }
-#dapp-host.dapp-visible {
+#website-host.website-visible {
   visibility: visible;
   pointer-events: auto;
 }
-#dapp-host.dapp-visible.with-warning {
+#website-host.website-visible.with-warning {
   top: 37px; height: calc(100% - 37px);
 }
-#dapp-frame {
+#website-frame {
   width: 100%; height: 100%; border: none; display: block;
 }
 /* The shadow DOM iframe inside will be 100%×100% */
@@ -187,7 +186,7 @@ html, body {
 }
 .raw-download a:hover { border-color: var(--accent); }
 
-/* ---- Unverified gate — transparent click-blocker; dApp visible underneath ---- */
+/* ---- Unverified gate — transparent click-blocker; website visible underneath ---- */
 #unverified-gate {
   position: fixed; inset: 0; z-index: 60;
   background: transparent; cursor: pointer;

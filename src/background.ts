@@ -1,3 +1,4 @@
+import { w3log, initW3Debug } from './lib/log'
 import { parseWeb3URL } from './lib/w3/url-parser.js'
 import { RpcClient, createVerifiedRpc } from './lib/rpc/light-client.js'
 import { getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/verify/tx-verifier.js'
@@ -10,12 +11,15 @@ import { fetchContractContent } from './lib/w3/erc5219.js'
 import type { ContractContent } from './lib/w3/erc5219.js'
 import { verifyViaBeacon, isEip2935Error, SUPERSEDED } from './lib/verify/beacon-verifier.js'
 import { timestampToSlot } from './lib/verify/beacon-primitives.js'
-import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
+import type { WebsiteProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
 import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS, AGREEMENT_VERSION } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode, HistSource } from './types.js'
 import { listWallets, ethRequest as walletRequest } from './lib/wallets/extension-wallet-bridge.js'
 import { isFrameAvailable, frameRequest } from './lib/wallets/local-wallet-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
+
+// Gate the verbose [w3] trace behind the dev-mode setting (quiet in production).
+initW3Debug()
 
 // First install → open the Terms-of-Use onboarding page.
 chrome.runtime.onInstalled.addListener((details) => {
@@ -108,7 +112,7 @@ const heliosInflight = new Map<string, Promise<{ result?: unknown; error?: strin
 
 // Stale-while-revalidate cache for small primitive reads only.
 // eth_call and similar can return megabytes oded of ABI-encdata — caching those
-// inflates the SW heap unboundedly under a polling dapp and triggers OOM.
+// inflates the SW heap unboundedly under a polling website and triggers OOM.
 // Only cache methods whose results are always small (< ~100 bytes).
 const CACHEABLE_METHODS = new Set([
   'eth_blockNumber', 'eth_getBalance', 'eth_getTransactionCount',
@@ -117,8 +121,8 @@ const CACHEABLE_METHODS = new Set([
 const heliosReadCache = new Map<string, unknown>()
 const MAX_READ_CACHE = 200
 
-// Trusted-reads toggle: when on, dapp RUNTIME reads (eth_call quotes, balances, …) are
-// served from the fast execution RPC WITHOUT Helios verification, so a read-heavy dapp
+// Trusted-reads toggle: when on, website RUNTIME reads (eth_call quotes, balances, …) are
+// served from the fast execution RPC WITHOUT Helios verification, so a read-heavy website
 // responds at normal-RPC speed instead of waiting on per-slot eth_getProof. 
 let trustedReads = true
 chrome.storage.session.get('trustedReads').then(v => { trustedReads = v.trustedReads !== false }).catch(() => {})
@@ -131,7 +135,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // clone travels to the renderer. Cap at 4 concurrent slots so at
 // most 4 large results exist in memory at once.
 let ethCallSlots = 0
-// Read-heavy dapps need more parallel Helios reads.
+// Read-heavy websites need more parallel Helios reads.
 // 8 balances throughput against the renderer-heap limit.
 const ETH_CALL_MAX_SLOTS = 8
 const ethCallWaiters: Array<() => void> = []
@@ -151,19 +155,19 @@ function isPortalLikelyDown(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Per-dapp proof cache (chrome.storage.local)
+// Per-website proof cache (chrome.storage.local)
 // Key: raw w3:// URL. Value: txHash (for ENS staleness) + 13-hash Merkle proof.
 // Skips era file / parquet / exec-header download on re-visit.
 // ---------------------------------------------------------------------------
 interface StoredProof { txHash: string; merklePaths: (string | null)[]; chainId?: number }
 
 async function readProofCache(): Promise<Record<string, StoredProof>> {
-  const { dapp_proof_cache } = await chrome.storage.local.get('dapp_proof_cache')
-  return (dapp_proof_cache as Record<string, StoredProof>) ?? {}
+  const { website_proof_cache } = await chrome.storage.local.get('website_proof_cache')
+  return (website_proof_cache as Record<string, StoredProof>) ?? {}
 }
 
 function writeProofCache(cache: Record<string, StoredProof>): void {
-  chrome.storage.local.set({ dapp_proof_cache: cache }).catch(() => {})
+  chrome.storage.local.set({ website_proof_cache: cache }).catch(() => {})
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +216,7 @@ function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       }, 60_000)
     })
     rpcCache.set(chain.chainId, p)
-    // The fresh instance (OOS probe + keepalive restarts) exists only to serve dapp
+    // The fresh instance (OOS probe + keepalive restarts) exists only to serve website
     // eth_call reads. It is NOT spawned here: a static page needs Helios once, to
     // verify its calldata, and then nothing more — spawning the fresh probe for it
     // meant a permanent OOS/restart loop for a page that never makes a call.
@@ -224,7 +228,7 @@ function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
 }
 
 // Fresh Helios cache — resolves after the base is ready AND a new block has
-// been observed, resetting drift to near-zero. Used by ethRpcCall so dapp
+// been observed, resetting drift to near-zero. Used by ethRpcCall so website
 // eth_call reads land on Helios well within the out-of-sync threshold.
 function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
   if (!freshRpcCache.has(chain.chainId)) {
@@ -239,7 +243,7 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       for (let i = 0; i < 120; i++) {
         try {
           await rpc.request<string>('eth_blockNumber', [], true)  // quickFail — skip internal 3s retry
-          if (i > 0) console.log(`[w3] Helios OOS probe resolved in ${Math.round((Date.now() - t0) / 1000)}s`)
+          if (i > 0) w3log(`[w3] Helios OOS probe resolved in ${Math.round((Date.now() - t0) / 1000)}s`)
           return rpc  // execution head confirmed live
         } catch (err: any) {
           if (!(err?.message ?? '').includes('out of sync')) return rpc  // non-OOS error, proceed
@@ -247,7 +251,7 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
           if (Number(lastLag) >= OOS_RESTART_LAG_SECONDS) { wedged = true; break }
         }
         if (i > 0 && i % 10 === 0) {
-          console.log(`[w3] Helios OOS probe still waiting (${Math.round((Date.now() - t0) / 1000)}s, ${lastLag}s behind)…`)
+          w3log(`[w3] Helios OOS probe still waiting (${Math.round((Date.now() - t0) / 1000)}s, ${lastLag}s behind)…`)
         }
         await new Promise(r => setTimeout(r, 500))
       }
@@ -428,7 +432,7 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'helios-keepalive') {
     // Ping arrives every 10s from the renderer. Use it to health-check Helios:
     // one WASM eth_blockNumber call (no public RPC — Helios serves from its
-    // internal cached head). If OOS, re-probe early before the dapp reads.
+    // internal cached head). If OOS, re-probe early before the website reads.
     //
     // The port itself is what keeps the service worker alive, so it stays open for
     // every page. But the health-check/restart work below is skipped unless the
@@ -488,7 +492,7 @@ async function twoPhaseResolve(
   port: chrome.runtime.Port,
 ) {
   console.clear()
-  console.log('[w3] twoPhaseResolve start', rawUrl)
+  w3log('[w3] twoPhaseResolve start', rawUrl)
   const send = (msg: BgResponse) => { try { port.postMessage(msg) } catch {} }
 
   // Per-tab generation: if a newer navigation starts for this tab before we finish,
@@ -500,7 +504,7 @@ async function twoPhaseResolve(
   const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
   const defaultChain = (stored.defaultChain as number | undefined) ?? 1
   const parsed = parseWeb3URL(rawUrl, defaultChain)
-  console.log('[w3] parsed chainId:', parsed.chainId, 'target:', parsed.target)
+  w3log('[w3] parsed chainId:', parsed.chainId, 'target:', parsed.target)
   let chain = chains[parsed.chainId]
   if (!chain) {
     send({ type: 'error', message: `Unsupported chainId ${parsed.chainId}.` })
@@ -517,7 +521,7 @@ async function twoPhaseResolve(
   // ── Phase 1: fetch via plain RPC, show content immediately ───────────────
   // Common to all 4 modes (see VERIFICATION.md) — name resolution, calldata parsing,
   // and the tx-trie rebuild that binds calldata to the block it's rendered from.
-  console.log('[w3] Phase 1 — content fetch & assembly (plain RPC, not yet trusted)')
+  w3log('[w3] Phase 1 — content fetch & assembly (plain RPC, not yet trusted)')
   if (tabId) setBadgeLoading(tabId)
 
   let assembled: Uint8Array
@@ -575,7 +579,7 @@ async function twoPhaseResolve(
       // Block-indexed record — use Portal or direct block fetch
       if (chain.portalRpc && !isPortalLikelyDown()) {
         try {
-          console.log('[w3] Block-indexed record — fetching from Portal')
+          w3log('[w3] Block-indexed record — fetching from Portal')
           const result = await fetchCalldataFromPortal(chain.portalRpc, chunk, fastRpc)
           phase1UsedPortal = true
           return result
@@ -633,7 +637,7 @@ async function twoPhaseResolve(
   // and 60 s hash — so bail before starting it rather than racing a redundant pipeline whose
   // result the supersede guard would only discard at the badge write.
   if (isSuperseded()) {
-    console.log('[w3] Phase 2 skipped — superseded by a newer navigation for this tab')
+    w3log('[w3] Phase 2 skipped — superseded by a newer navigation for this tab')
     port.disconnect()
     return
   }
@@ -643,7 +647,7 @@ async function twoPhaseResolve(
   // so a successful fetch from the user's own node needs no re-verification —
   // the beacon pipeline below is skipped entirely (portalVerified: true).
   if (chain.portalRpc && !phase1PortalFailed && !isPortalLikelyDown()) {
-    console.log('[w3] Mode 3 — Portal-trusted: trying', chain.portalRpc)
+    w3log('[w3] Mode 3 — Portal-trusted: trying', chain.portalRpc)
     // Start Helios in parallel for ENS re-verification — skipped in local mode (no external calls).
     const portalHeliosPromise = (!chain.localMode && parsed.target.type === 'ens' && phase1EnsChunks.length > 0 && chain.consensusRpcs.length > 0)
       ? Promise.race([
@@ -658,15 +662,15 @@ async function twoPhaseResolve(
         await getCalldataViaPortal(chain.portalRpc, phase1BlockNumber, phase1TxIndex)
       }
       const trieVerified = true  // Portal pre-verifies trie before storing
-      console.log('[w3] Mode 3 — Portal-trusted: calldata ∈ tx ∈ block ∈ canonical chain delegated to Portal node', phase1UsedPortal ? '(Phase 1 already used Portal)' : '')
+      w3log('[w3] Mode 3 — Portal-trusted: calldata ∈ tx ∈ block ∈ canonical chain delegated to Portal node', phase1UsedPortal ? '(Phase 1 already used Portal)' : '')
 
       const portalHeliosRpc = await portalHeliosPromise
-      console.log('[w3] Mode 3 — ENS/GNS re-verification: helios rpc ready:', !!portalHeliosRpc, 'heliosBacked:', portalHeliosRpc?.isHeliosBacked())
+      w3log('[w3] Mode 3 — ENS/GNS re-verification: helios rpc ready:', !!portalHeliosRpc, 'heliosBacked:', portalHeliosRpc?.isHeliosBacked())
       if (portalHeliosRpc?.isHeliosBacked() && parsed.target.type === 'ens') {
         try {
           const heliosResolution = await resolveEns(parsed.target.name, portalHeliosRpc)
           ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-          console.log('[w3] Mode 3 — ENS/GNS re-verification result:', ensVerified)
+          w3log('[w3] Mode 3 — ENS/GNS re-verification result:', ensVerified)
         } catch (e) {
           console.warn('[w3] Mode 3 — ENS/GNS re-verification error:', (e as Error).message)
           ensVerified = undefined
@@ -686,7 +690,7 @@ async function twoPhaseResolve(
           chunks: proofChunks,
         },
       }
-      console.log('[w3] Mode 3 — Portal-trusted: done, ensOk:', parsed.target.type !== 'ens' || ensVerified === true)
+      w3log('[w3] Mode 3 — Portal-trusted: done, ensOk:', parsed.target.type !== 'ens' || ensVerified === true)
       if (isSuperseded()) { port.disconnect(); return }
       await updateBadge(tabId, update)
       send(update)
@@ -700,7 +704,7 @@ async function twoPhaseResolve(
 
   // ── Local mode: trie-verify via local exec RPC only — no external calls ──
   if (chain.localMode) {
-    console.log('[w3] Mode 4 — Local mode: trusted to local execution RPC, no Helios/beacon/ENS check')
+    w3log('[w3] Mode 4 — Local mode: trusted to local execution RPC, no Helios/beacon/ENS check')
     const update: VerificationUpdate = {
       type: 'verification-update',
       heliosBacked: false,
@@ -730,22 +734,22 @@ async function twoPhaseResolve(
   const oldestTimestamp = Math.min(...phase1Results.map(r => r.blockTimestamp))
   const blockIsHistorical = (Date.now() / 1000) - oldestTimestamp > EIP_2935_BUFFER_SECONDS
 
-  // Look up per-dapp proof cache (era Merkle proofs, one per chunk) and chain-level
+  // Look up per-website proof cache (era Merkle proofs, one per chunk) and chain-level
   // era BSR cache. Old single-merklePath entries lack merklePaths — treated as a miss.
   const [proofCache, eraBsrCache] = await Promise.all([readProofCache(), readEraBsrCache()])
   const cachedEntry = proofCache[rawUrl]
-  const cachedProof: DappProofData | undefined = cachedEntry
+  const cachedProof: WebsiteProofData | undefined = cachedEntry
     && Array.isArray(cachedEntry.merklePaths)
     && cachedEntry.merklePaths.length === phase1Results.length
     && (parsed.target.type === 'tx' || cachedEntry.txHash.toLowerCase() === txHash.toLowerCase())
     ? { merklePaths: cachedEntry.merklePaths } : undefined
-  if (cachedProof) console.log('[w3] Dapp proof cache hit — skipping era file download')
+  if (cachedProof) w3log('[w3] Website proof cache hit — skipping era file download')
 
   // Dev mode: pin the era block_roots source and/or the BeaconState source.
   // Off (or 'auto') leaves the normal fallback/race behaviour untouched.
   const dev = await readDevSettings()
   if (dev.devMode && (dev.forceMode !== 'auto' || dev.eraSource !== 'auto' || dev.stateSource !== 'auto' || dev.histSource !== 'auto')) {
-    console.log(`[w3] Dev mode — mode: ${dev.forceMode}, era source: ${dev.eraSource}, BeaconState source: ${dev.stateSource}, historical_summaries: ${dev.histSource}`)
+    w3log(`[w3] Dev mode — mode: ${dev.forceMode}, era source: ${dev.eraSource}, BeaconState source: ${dev.stateSource}, historical_summaries: ${dev.histSource}`)
     if (dev.forceMode !== 'beacon' && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto' || dev.histSource !== 'auto') && !blockIsHistorical) {
       console.warn('[w3] Dev mode — target is a recent block, so Mode 1 (Helios) will handle it and the ' +
         'era / BeaconState / historical_summaries sources will NOT be used. Set mode to "beacon" to force Mode 2.')
@@ -757,7 +761,7 @@ async function twoPhaseResolve(
   // would silently verify from cache and never touch parquet at all.
   const pinned = dev.devMode && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto' || dev.histSource !== 'auto')
   if (pinned && (cachedProof || eraBsrCache[chain.chainId])) {
-    console.log('[w3] Dev mode — bypassing proof/BSR cache so the pinned source actually runs')
+    w3log('[w3] Dev mode — bypassing proof/BSR cache so the pinned source actually runs')
   }
 
   const beaconOptions = {
@@ -780,7 +784,7 @@ async function twoPhaseResolve(
   const useBeacon = (blockIsHistorical || forceBeacon) && !forceHelios
 
   if (useBeacon && chain.consensusRpcs.length > 0) {
-    console.log(forceBeacon && !blockIsHistorical
+    w3log(forceBeacon && !blockIsHistorical
       ? '[w3] Mode 2 — Historical block, beacon-verified: FORCED by dev mode (block is recent enough for Mode 1)'
       : '[w3] Mode 2 — Historical block, beacon-verified: oldest chunk outside Helios\'s EIP-2935 ring, starting Helios in parallel for the anchor')
     // Pass Helios promise unawaited — verification runs immediately using fast consensus
@@ -801,7 +805,7 @@ async function twoPhaseResolve(
         execRpcs,
         beaconOptions,
       )
-      console.log('[w3] Mode 2 — beacon pipeline done: heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified, `(${phase1Results.length} chunk(s))`)
+      w3log('[w3] Mode 2 — beacon pipeline done: heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified, `(${phase1Results.length} chunk(s))`)
       if (beacon.proofData) {
         proofCache[rawUrl] = { txHash, chainId: chain.chainId, ...beacon.proofData }
         writeProofCache(proofCache)
@@ -820,7 +824,7 @@ async function twoPhaseResolve(
             throw new Error(`Tx hash mismatch at index ${r.txIndex}: block has ${verifiedTxHash}, expected ${r.txHash}`)
         }
         trieVerified = true
-        console.log('[w3] Mode 2 — tx trie → header → blockhash verified for all chunks ✓')
+        w3log('[w3] Mode 2 — tx trie → header → blockhash verified for all chunks ✓')
       } catch (trieErr) {
         console.warn('[w3] Mode 2 — tx inclusion verification failed:', (trieErr as Error).message)
       }
@@ -830,7 +834,7 @@ async function twoPhaseResolve(
         try {
           const heliosResolution = await resolveEns(parsed.target.name, historicalHeliosRpc)
           ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-          console.log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
+          w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
         } catch {
           ensVerified = undefined
         }
@@ -854,7 +858,7 @@ async function twoPhaseResolve(
       // Superseded by a newer navigation (or aborted mid-flight because of one) — a quiet,
       // expected outcome, not a failure. Drop this stale run without touching the badge.
       if ((beaconErr as Error).message === SUPERSEDED || isSuperseded()) {
-        console.log('[w3] Mode 2 — discarded: superseded by a newer navigation for this tab')
+        w3log('[w3] Mode 2 — discarded: superseded by a newer navigation for this tab')
         port.disconnect()
         return
       }
@@ -877,7 +881,7 @@ async function twoPhaseResolve(
     return
   }
 
-  console.log('[w3] Mode 1 — Recent block, Helios-verified: creating Helios RPC for chain', chain.chainId)
+  w3log('[w3] Mode 1 — Recent block, Helios-verified: creating Helios RPC for chain', chain.chainId)
   let update: VerificationUpdate
   // Hoist so the EIP-2935 fallback can pass heliosRpc as an EIP-4788 anchor
   let heliosRpc: Awaited<ReturnType<typeof getOrCreateRpc>> | undefined
@@ -899,7 +903,7 @@ async function twoPhaseResolve(
         ? `Helios init failed — ${heliosInitErr}`
         : 'Helios not available (35s timeout — still syncing or consensus RPC unreachable)')
     }
-    console.log('[w3] Mode 1 — got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
+    w3log('[w3] Mode 1 — got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
     // Verify EVERY chunk through Helios and bind the phase-1 rendered bytes to the
     // Helios-verified calldata. Without the byte comparison, a fast RPC serving a
     // self-consistent forgery in phase 1 would render forged content while phase 2
@@ -911,13 +915,13 @@ async function twoPhaseResolve(
       if (!bytesEqual(result.calldata, p1.calldata))
         throw new Error(`Rendered calldata mismatch: chunk ${i} (block ${p1.blockNumber}, tx ${p1.txIndex}) does not match Helios-verified calldata`)
     }
-    console.log(`[w3] Mode 1 — render binding: ${phase1Results.length} chunk(s) verified, rendered bytes match Helios ✓`)
+    w3log(`[w3] Mode 1 — render binding: ${phase1Results.length} chunk(s) verified, rendered bytes match Helios ✓`)
 
     if (parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
       try {
         const heliosResolution = await resolveEns(parsed.target.name, heliosRpc)
         ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-        console.log('[w3] Mode 1 — ENS/GNS re-verification result:', ensVerified)
+        w3log('[w3] Mode 1 — ENS/GNS re-verification result:', ensVerified)
       } catch {
         ensVerified = undefined
       }
@@ -943,7 +947,7 @@ async function twoPhaseResolve(
     console.warn('[w3] Mode 1 — Recent block, Helios-verified: failed —', (err as Error).message)
 
     if (isEip2935Error(err) && chain.consensusRpcs.length > 0) {
-      console.log('[w3] Mode 1 failed (EIP-2935, block outside Helios\'s ring) — falling back to Mode 2 — Historical block, beacon-verified')
+      w3log('[w3] Mode 1 failed (EIP-2935, block outside Helios\'s ring) — falling back to Mode 2 — Historical block, beacon-verified')
       try {
         const beacon = await verifyViaBeacon(
           phase1Results.map(r => ({ executionHash: r.blockHash, blockTimestamp: r.blockTimestamp })),
@@ -953,7 +957,7 @@ async function twoPhaseResolve(
           execRpcs,
           beaconOptions,
         )
-        console.log(
+        w3log(
           '[w3] Mode 2 — beacon pipeline done: heliosAnchored:', beacon.heliosAnchored,
           'eraVerified:', beacon.eraVerified,
         )
@@ -973,7 +977,7 @@ async function twoPhaseResolve(
               throw new Error(`Tx hash mismatch at index ${r.txIndex}: block has ${verifiedTxHash}, expected ${r.txHash}`)
           }
           trieVerified2 = true
-          console.log('[w3] Mode 2 — tx trie → header → blockhash verified for all chunks ✓')
+          w3log('[w3] Mode 2 — tx trie → header → blockhash verified for all chunks ✓')
         } catch (trieErr) {
           console.warn('[w3] Mode 2 — tx inclusion verification failed:', (trieErr as Error).message)
         }
@@ -982,7 +986,7 @@ async function twoPhaseResolve(
           try {
             const heliosResolution = await resolveEns(parsed.target.name, heliosRpc)
             ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-            console.log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
+            w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
           } catch {
             ensVerified = undefined
           }
@@ -1004,7 +1008,7 @@ async function twoPhaseResolve(
         }
       } catch (beaconErr) {
         if ((beaconErr as Error).message === SUPERSEDED || isSuperseded()) {
-          console.log('[w3] Mode 2 — discarded: superseded by a newer navigation for this tab')
+          w3log('[w3] Mode 2 — discarded: superseded by a newer navigation for this tab')
           port.disconnect()
           return
         }
@@ -1094,7 +1098,7 @@ async function resolveContractServed(
     return
   }
   const execRpcs = chain.localMode ? chain.rpcs.slice(0, 1) : chain.rpcs
-  console.log('[w3] Contract-served (ERC-5219/8244) —', address, 'on chain', chainId)
+  w3log('[w3] Contract-served (ERC-5219/8244) —', address, 'on chain', chainId)
 
   // ── Phase 1: plain-RPC eth_call, paint immediately ───────────────────────
   if (tabId) setBadgeLoading(tabId)
@@ -1149,7 +1153,7 @@ async function resolveContractServed(
   let update: VerificationUpdate
   try {
     if (chain.localMode) {
-      console.log('[w3] Contract-served — local mode: trusted to local exec RPC, no Helios check')
+      w3log('[w3] Contract-served — local mode: trusted to local exec RPC, no Helios check')
       update = contractUpdate(rawUrl, address, content, blockNumber, blockHash,
         { heliosBacked: false, trieVerified: false, verified: true, localMode: true })
     } else {
@@ -1183,7 +1187,7 @@ async function resolveContractServed(
       if (!verified) throw lastErr ?? new Error('Helios verification failed')
 
       const match = bytesEqual(verified.body, content.body)
-      console.log(match
+      w3log(match
         ? '[w3] Contract-served — Helios re-call matches rendered bytes ✓'
         : '[w3] Contract-served — Helios body MISMATCH (possible forgery or state drift)')
       update = contractUpdate(rawUrl, address, verified, blockNumber, blockHash,
@@ -1260,7 +1264,7 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
     : portalTrusted || update.portalVerified ? 'Mode 3 — Portal-trusted'
     : update.beaconVerified ? 'Mode 2 — Historical block, beacon-verified'
     : 'no mode succeeded'
-  console.log(`[w3] Badge verdict: ${modeLabel} → ${fullyVerified ? '✓ verified' : '✗ unverified'} (ensOk=${ensOk})`)
+  w3log(`[w3] Badge verdict: ${modeLabel} → ${fullyVerified ? '✓ verified' : '✗ unverified'} (ensOk=${ensOk})`)
   // Tab may have been closed before verification finished — swallow the rejection.
   await Promise.allSettled([
     chrome.action.setBadgeText({ text, tabId }),
@@ -1293,7 +1297,7 @@ function clearBadge(tabId: number) {
 // ---------------------------------------------------------------------------
 // Wallet bridge — MetaMask (and compatible wallets) via direct background port.
 // Other wallets (Rabby, Rainbow, etc.) are handled by WalletConnect embedded
-// in the dApp itself; Chrome blocks cross-extension content script injection.
+// in the website itself; Chrome blocks cross-extension content script injection.
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1325,9 +1329,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 })
 
-// Broadcast an already-signed raw tx. The dapp's fetch shim rerouted an
+// Broadcast an already-signed raw tx. The website's fetch shim rerouted an
 // eth_sendRawTransaction here and the user approved a target in the renderer:
-//  - endpoint set  → POST to the dapp's own RPC (preserves MEV protection, e.g. mevblocker).
+//  - endpoint set  → POST to the website's own RPC (preserves MEV protection, e.g. mevblocker).
 //    Sent from the service worker, which is not bound by the sandbox page CSP.
 //  - endpoint null → broadcast via verum's configured RPC set.
 async function broadcastRawTx(chainId: number, rawTx: string, endpoint: string | null): Promise<{ result?: unknown; error?: string }> {
@@ -1416,7 +1420,7 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
     }
     // Queue this read — flushed as a batch once Helios is ready.
     // Timeout after 45s so message channels don't stay open indefinitely;
-    // resolve with stale cache or error so the dapp can handle it gracefully.
+    // resolve with stale cache or error so the website can handle it gracefully.
     return new Promise<{ result?: unknown; error?: string }>(resolve => {
       const timer = setTimeout(() => {
         resolve(heliosReadCache.has(cacheKey)
@@ -1526,9 +1530,9 @@ async function listAvailableWallets(): Promise<Array<{ name: string; id: string 
 }
 
 // Per-wallet open-connection tracking, keyed by tab. The shared wallet (MetaMask/Frame)
-// is one connection behind every open dapp, so a dapp's disconnect (wallet_revokePermissions)
+// is one connection behind every open website, so a website's disconnect (wallet_revokePermissions)
 // must only tear down that shared grant when it's the LAST tab using the wallet — otherwise
-// disconnecting one dapp revokes the wallet for every other open dapp. Separate sets per
+// disconnecting one website revokes the wallet for every other open website. Separate sets per
 // walletId keep MetaMask and Frame counted independently.
 const walletTabs = new Map<string, Set<number>>()
 function registerWalletTab(walletId: string, tabId: number | undefined) {
@@ -1552,8 +1556,8 @@ const CONNECT_METHODS_BG = new Set(['eth_requestAccounts', 'wallet_requestPermis
 
 async function handleEthRequest(method: string, params: unknown[], walletId: string, tabId?: number): Promise<unknown> {
   // Disconnect: forward the revoke to the wallet only when this is the last open connection.
-  // Otherwise drop just this tab and report success — the dapp disconnects locally without
-  // tearing down the shared wallet grant that other open dapps still rely on.
+  // Otherwise drop just this tab and report success — the website disconnects locally without
+  // tearing down the shared wallet grant that other open websites still rely on.
   if (method === 'wallet_revokePermissions') {
     if (!releaseWalletTab(walletId, tabId)) return { result: null }
   }

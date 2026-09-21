@@ -1,3 +1,4 @@
+import { w3log } from '../../log'
 // Era block_roots via .era files (nimbus.team era servers): two targeted HTTP
 // range requests extract just the block_roots vector from a compressed
 // BeaconState, without downloading the full multi-hundred-MB file. Includes a
@@ -210,7 +211,7 @@ async function tryEraUrl(
   //   offset[j] = (dataAbsPos + 8) − offsetFieldAbsPos   (signed, relative to field)
   // So:  stateDataAbsPos  = offsetFieldAbsPos + offsetVal − 8
   //      stateHeaderAbsPos = stateDataAbsPos − 8  (the 8-byte e2store header)
-  console.log(`[w3] Era ${era}: tail fetch (${ERA_TAIL_FETCH >> 10}KB) from ${url}`)
+  w3log(`[w3] Era ${era}: tail fetch (${ERA_TAIL_FETCH >> 10}KB) from ${url}`)
   const tail = await eraFetch(url, `bytes=-${ERA_TAIL_FETCH}`, 30_000)
   if (!tail) { console.warn(`[w3] Era ${era}: tail fetch failed`); return null }
   const { buf: tailBuf, fileSize } = tail
@@ -235,11 +236,11 @@ async function tryEraUrl(
   if (stateHeaderAbsPos <= 0 || stateHeaderAbsPos >= fileSize) {
     console.warn(`[w3] Era ${era}: bad stateHeaderAbsPos=${stateHeaderAbsPos}`); return null
   }
-  console.log(`[w3] Era ${era}: count=${count} stateHeaderAbsPos=${stateHeaderAbsPos}`)
+  w3log(`[w3] Era ${era}: count=${count} stateHeaderAbsPos=${stateHeaderAbsPos}`)
 
   // ── Step 2: fetch state entry (header + compressed data) 
   const fetchEnd = Math.min(stateHeaderAbsPos + ERA_STATE_FETCH - 1, fileSize - 1)
-  console.log(`[w3] Era ${era}: state fetch bytes ${stateHeaderAbsPos}–${fetchEnd}`)
+  w3log(`[w3] Era ${era}: state fetch bytes ${stateHeaderAbsPos}–${fetchEnd}`)
   const sf = await eraFetch(url, `bytes=${stateHeaderAbsPos}-${fetchEnd}`, 120_000)
   if (!sf) { console.warn(`[w3] Era ${era}: state fetch failed`); return null }
   const stateBuf = sf.buf
@@ -254,7 +255,7 @@ async function tryEraUrl(
   }
   const stateDataLen = readU32LE(stateBuf, 2)
   const stateData    = stateBuf.subarray(8)
-  console.log(`[w3] Era ${era}: state compressed=${stateDataLen}B fetched ${stateData.length}B`)
+  w3log(`[w3] Era ${era}: state compressed=${stateDataLen}B fetched ${stateData.length}B`)
 
   // ── Step 3: decompress and extract block_roots
   const need = BLOCK_ROOTS_SSZ_OFFSET + BLOCK_ROOTS_SSZ_LEN  // 262320 bytes
@@ -283,7 +284,7 @@ async function tryEraUrl(
     console.warn(`[w3] Era ${era}: block_summary_root mismatch: computed=${computed} expected=${expectedBlockSummaryRoot}`); return null
   }
 
-  console.log(`[w3] Era ${era}: block_roots verified via era file ✓ (stateCompressed=${stateDataLen}B)`)
+  w3log(`[w3] Era ${era}: block_roots verified via era file ✓ (stateCompressed=${stateDataLen}B)`)
   return roots
 }
 
@@ -456,6 +457,6 @@ async function tryEraUrlHS(url: string, era: number, chainId: number): Promise<U
   const blobStart = q - (nEntries - 1) * 64
   const blobEnd = q + 64
   if (blobStart < 0 || blobEnd > tailU.length) return null
-  console.log(`[w3] Era ${era} HS: historical_summaries via era-tail ✓ (${nEntries} entries, ${(HS_TAIL_FETCH / 1e6).toFixed(0)}MB suffix)`)
+  w3log(`[w3] Era ${era} HS: historical_summaries via era-tail ✓ (${nEntries} entries, ${(HS_TAIL_FETCH / 1e6).toFixed(0)}MB suffix)`)
   return tailU.slice(blobStart, blobEnd)
 }

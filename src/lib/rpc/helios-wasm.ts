@@ -1,3 +1,4 @@
+import { w3log } from '../log'
 import { createHeliosProvider } from '@a16z/helios'
 import type { HeliosProvider, Network } from '@a16z/helios'
 import type { IVerifiedRpc } from './light-client.js'
@@ -48,7 +49,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
     const syncAndProbe = async (execRpc: string): Promise<HeliosProvider> => {
       const host = execRpc.includes('.invalid') ? 'proxy' : new URL(execRpc).hostname
       const provider = await sync(execRpc)
-      console.log(`[w3] Helios (exec=${host}) probing EIP-4788…`)
+      w3log(`[w3] Helios (exec=${host}) probing EIP-4788…`)
       try {
         const block = await provider.request({
           method: 'eth_getBlockByNumber', params: ['finalized', false],
@@ -100,7 +101,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
     try {
       return await HeliosWasmClient.trySync(network, consensusRpc, executionRpc, cachedCheckpoint, 'cached checkpoint')
     } catch {
-      console.log('[w3] Helios cached checkpoint failed — retrying with live finalized root')
+      w3log('[w3] Helios cached checkpoint failed — retrying with live finalized root')
       return HeliosWasmClient.syncFresh(network, consensusRpc, executionRpc)
     }
   }
@@ -140,7 +141,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
         if (!r.ok) continue  // no block at this boundary either — step back an epoch
         const j = await r.json() as { data?: { root?: string } }
         if (j.data?.root) {
-          console.log(`[w3] Helios: finalized checkpoint at slot ${slot} is off-boundary ` +
+          w3log(`[w3] Helios: finalized checkpoint at slot ${slot} is off-boundary ` +
             `(skipped proposal) — bootstrapping from boundary slot ${boundary} instead`)
           return j.data.root
         }
@@ -160,7 +161,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
   ): Promise<HeliosProvider> {
     const execHost = executionRpc.includes('.invalid') ? 'proxy' : new URL(executionRpc).hostname
     const tag = `[w3] Helios (exec=${execHost})`
-    console.log(`${tag} creating provider (${checkpointLabel})`)
+    w3log(`${tag} creating provider (${checkpointLabel})`)
     // dbType is how Helios persists its own checkpoint between runs. Only
     // "localstorage" and "config" exist. localStorage does not exist in a service
     // worker.
@@ -174,7 +175,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
     )
     const t1 = Date.now()
     const ticker = setInterval(
-      () => console.log(`${tag} still syncing… (${Math.round((Date.now() - t1) / 1000)}s)`),
+      () => w3log(`${tag} still syncing… (${Math.round((Date.now() - t1) / 1000)}s)`),
       5_000,
     )
     try {

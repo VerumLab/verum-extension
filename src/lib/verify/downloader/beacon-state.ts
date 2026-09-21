@@ -1,3 +1,4 @@
+import { w3log } from '../../log'
 // Downloads the finalized BeaconState from a consensus RPC or checkpoint sync
 // provider, verifies its SSZ hash_tree_root, and extracts
 // historical_summaries[hsIndex].block_summary_root — plus block_roots[slot % 8192]
@@ -47,7 +48,7 @@ export async function getBlockSummaryRoot(
   const open = async (rpc: string, ac: AbortController): Promise<OpenState> => {
     if (ac.signal.aborted) throw new Error('open aborted before start')
     const stateId = await fetchLiveDlSlot(rpc, ac.signal)
-    console.log(`[w3] Fetching state (slot ${stateId}) from ${rpc}…`)
+    w3log(`[w3] Fetching state (slot ${stateId}) from ${rpc}…`)
     const res = await fetch(`${rpc}/eth/v2/debug/beacon/states/${stateId}`, {
       headers: { Accept: 'application/octet-stream', 'Accept-Encoding': 'gzip' },
       signal: ac.signal,
@@ -63,9 +64,9 @@ export async function getBlockSummaryRoot(
     const stateSlot = readU32LE(stateSSZ, 40)
     const verifier = computeBeaconStateRoot(stateSSZ, isGloasSlot(chainId, stateSlot) ? 'gloas' : undefined)
     if (verifier.computedRoot.toLowerCase() !== anchorStateRoot.toLowerCase()) {
-      console.log(`[w3] State slot=${stateSlot} anchorSlot=${anchorSlot} diff=${stateSlot - anchorSlot} — Helios will confirm at end`)
+      w3log(`[w3] State slot=${stateSlot} anchorSlot=${anchorSlot} diff=${stateSlot - anchorSlot} — Helios will confirm at end`)
     } else {
-      console.log(`[w3] State hash_tree_root matches anchor ✓ (slot ${stateSlot}, from ${rpc})`)
+      w3log(`[w3] State hash_tree_root matches anchor ✓ (slot ${stateSlot}, from ${rpc})`)
     }
 
     // Fast path: for every target slot within the rolling block_roots window of this
@@ -76,7 +77,7 @@ export async function getBlockSummaryRoot(
         const root = verifier.getBlockRootAtSlot(targetSlot)
         if (!/^0x0+$/.test(root)) {
           blockRootsAtSlots[targetSlot] = root
-          console.log(`[w3] block_roots[${targetSlot % 8192}] from BeaconState: ${root}`)
+          w3log(`[w3] block_roots[${targetSlot % 8192}] from BeaconState: ${root}`)
         }
       }
     }
@@ -85,7 +86,7 @@ export async function getBlockSummaryRoot(
     if (!blockSummaryRoot && Object.keys(blockRootsAtSlots).length === 0)
       throw new Error(`historical_summaries[${hsIndex}] (era ${era}) not found and no slot in rolling window`)
     if (blockSummaryRoot)
-      console.log(`[w3] historical_summaries[${hsIndex}] (era ${era}) block_summary_root: ${blockSummaryRoot}`)
+      w3log(`[w3] historical_summaries[${hsIndex}] (era ${era}) block_summary_root: ${blockSummaryRoot}`)
     return { blockSummaryRoot: blockSummaryRoot ?? '', effectiveStateRoot: verifier.computedRoot, effectiveSlot: stateSlot, blockRootsAtSlots, getHistoricalSummariesBlob: () => verifier.getHistoricalSummariesBlob(), computeHistoricalSummariesFieldProof: () => verifier.computeHistoricalSummariesFieldProof() }
   }
 
@@ -118,7 +119,7 @@ export async function getBlockSummaryRoot(
   const useCheckpoints = stateSource !== 'consensus-rpc'
   const useConsensus   = stateSource !== 'checkpoint'
   if (stateSource !== 'auto') {
-    console.log(`[w3] BeaconState: dev mode — forcing ${stateSource === 'checkpoint'
+    w3log(`[w3] BeaconState: dev mode — forcing ${stateSource === 'checkpoint'
       ? 'checkpoint providers' : 'consensus RPCs'} only`)
   }
 
@@ -244,7 +245,7 @@ export async function fetchFixedSectionAtSlot(
       const out = new Uint8Array(total); let p = 0
       for (const c of chunks) { out.set(c, p); p += c.length }
       const slot = readU32LE(out, 40)  // BeaconState.slot @ byte 40
-      console.log(`[w3] anchor fixed section: ${(total / 1e6).toFixed(2)}MB early-abort from ${rpc} (slot ${slot})`)
+      w3log(`[w3] anchor fixed section: ${(total / 1e6).toFixed(2)}MB early-abort from ${rpc} (slot ${slot})`)
       return { fixedSection: out.subarray(0, needBytes), slot }
     } catch { try { ac.abort() } catch {}; continue }
   }

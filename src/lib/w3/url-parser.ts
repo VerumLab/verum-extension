@@ -21,10 +21,10 @@ export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
   let chainId = defaultChainId
   let path = '/'
 
-  // Strip the URL fragment (#…) before parsing. Fragments are client-side dapp state (e.g.
+  // Strip the URL fragment (#…) before parsing. Fragments are client-side website state (e.g.
   // a share link's #token=ETH&out=wstETH), never part of the ERC-4804 resource, so they
   // must not reach name/path parsing. The renderer extracts the fragment from the raw URL
-  // separately and injects it into the sandbox so the dapp can restore its state.
+  // separately and injects it into the sandbox so the website can restore its state.
   const hashIdx = rest.indexOf('#')
   if (hashIdx !== -1) rest = rest.slice(0, hashIdx)
 

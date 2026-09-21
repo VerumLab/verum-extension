@@ -1,3 +1,4 @@
+import { w3log } from '../log'
 /**
  * Full BeaconState SSZ hash_tree_root computation.
  *
@@ -1036,7 +1037,7 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array, fork?: 'gloas'): Be
   const isElectra = fixedPrefixSize >= 2736713
 
   const isFulu = fixedPrefixSize >= 2737225
-  console.log(`[w3] computeBeaconStateRoot: stateLen=${stateSSZ.length} fixedPrefixSize=${fixedPrefixSize} isElectra=${isElectra} isFulu=${isFulu}`)
+  w3log(`[w3] computeBeaconStateRoot: stateLen=${stateSSZ.length} fixedPrefixSize=${fixedPrefixSize} isElectra=${isElectra} isFulu=${isFulu}`)
 
   // ── Variable-field offset pointers ─────────────────────────────────────
   const offHistoricalRoots = fixedPrefixSize          // same value we just read
@@ -1129,7 +1130,7 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array, fork?: 'gloas'): Be
   const computedRoot = hexlify(merkleizeExact(fieldRoots))
 
   const nHistSummaries = Math.floor(histSummaries.length / 64)
-  console.log(`[w3] historical_summaries count = ${nHistSummaries} (CAPELLA_ERA = anchorEra - ${nHistSummaries})`)
+  w3log(`[w3] historical_summaries count = ${nHistSummaries} (CAPELLA_ERA = anchorEra - ${nHistSummaries})`)
 
   return {
     computedRoot,

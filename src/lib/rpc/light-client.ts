@@ -1,3 +1,4 @@
+import { w3log } from '../log'
 import { HeliosWasmClient } from './helios-wasm.js'
 import type { ChainConfig } from '../../types.js'
 
@@ -151,7 +152,7 @@ function proxyTally(methods: string[], ms: number) {
   }
   if (!_proxyFlush) _proxyFlush = setTimeout(() => {
     const parts = [...(_proxyStats)].map(([m, s]) => `${m}×${s.n} (avg ${Math.round(s.ms / s.n)}ms)`)
-    console.log('[w3] proxy exec /2s:', parts.join(', '))
+    w3log('[w3] proxy exec /2s:', parts.join(', '))
     _proxyStats.clear(); _proxyFlush = null
   }, 2000)
 }
@@ -202,7 +203,7 @@ async function repairLightClientUpdates(res: Response, path: string): Promise<Re
   if (selected.length === 0) return null  // nothing for the requested range — fail over
 
   if (selected.length !== updates.length) {
-    console.log(`[w3] Helios consensus: light_client/updates returned ${updates.length} update(s) ` +
+    w3log(`[w3] Helios consensus: light_client/updates returned ${updates.length} update(s) ` +
       `for start_period=${start}&count=${count} — using the ${selected.length} in range, in order`)
   }
 
@@ -427,7 +428,7 @@ export async function createVerifiedRpc(chain: ChainConfig, forceFresh = false):
       `Use local-node or trusted-reads mode.`,
     )
   }
-  console.log(`[w3] Helios proxy (${network}): ${chain.rpcs.length} exec + ${chain.consensusRpcs.length} consensus RPCs for chainId ${chain.chainId}`)
+  w3log(`[w3] Helios proxy (${network}): ${chain.rpcs.length} exec + ${chain.consensusRpcs.length} consensus RPCs for chainId ${chain.chainId}`)
 
   const execKey = `w3-exec-${chain.chainId}-0.invalid`
   const consKey = `w3-cons-${chain.chainId}-0.invalid`

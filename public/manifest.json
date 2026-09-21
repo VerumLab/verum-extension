@@ -3,7 +3,7 @@
   "name": "Verum",
   "short_name": "verum",
   "version": "0.1.0",
-  "description": "Browse w3:// dapps, websites and data stored on Ethereum, verified by Helios light client",
+  "description": "Browse w3:// websites, websites and data stored on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",
     "storage"
@@ -27,7 +27,6 @@
     "*://*.sigp.io/*",
     "*://*.beaconstate.info/*",
     "*://*.nimbus.team/*",
-    "*://raw.githubusercontent.com/*",
     "*://*.beaconcha.in/*",
     "http://127.0.0.1:*/*",
     "http://localhost:*/*",
@@ -66,11 +65,11 @@
     "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; script-src 'self' 'unsafe-inline' data: blob:; style-src 'self' 'unsafe-inline'; img-src * data: blob:; default-src 'self' blob: data:"
   },
   "sandbox": {
-    "pages": ["dapp-sandbox.html"]
+    "pages": ["website-sandbox.html"]
   },
   "web_accessible_resources": [
     {
-      "resources": ["renderer.html", "dapp-sandbox.html", "chunks/*"],
+      "resources": ["renderer.html", "website-sandbox.html", "chunks/*"],
       "matches": ["<all_urls>"]
     }
   ]

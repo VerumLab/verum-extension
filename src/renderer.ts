@@ -1,6 +1,6 @@
 import { formatWeb3URL, parseWeb3URL } from './lib/w3/url-parser.js'
 import { parseBundle, bundleFileAt } from './lib/w3/content.js'
-import { buildDappHtml } from './lib/w3/dapp-html.js'
+import { buildWebsiteHtml } from './lib/w3/website-html.js'
 import { startRocketGame, stopRocketGame } from './rocket-game.js'
 import { AGREEMENT_VERSION } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate } from './types.js'
@@ -10,8 +10,8 @@ const loading         = document.getElementById('loading') as HTMLDivElement
 const loadingText     = document.getElementById('loading-text') as HTMLParagraphElement
 const errorPanel      = document.getElementById('error-panel') as HTMLDivElement
 const errorMessage    = document.getElementById('error-message') as HTMLPreElement
-const dappHost        = document.getElementById('dapp-host') as HTMLDivElement
-const dappFrame       = document.getElementById('dapp-frame') as HTMLIFrameElement
+const websiteHost        = document.getElementById('website-host') as HTMLDivElement
+const websiteFrame       = document.getElementById('website-frame') as HTMLIFrameElement
 const rawView         = document.getElementById('raw-view') as HTMLDivElement
 const warningBanner   = document.getElementById('warning-banner') as HTMLDivElement
 const warningText     = document.getElementById('warning-text') as HTMLSpanElement
@@ -23,20 +23,20 @@ const heliosBadge     = document.getElementById('helios-badge') as HTMLDivElemen
 
 function showWarning() {
   warningBanner.classList.remove('hidden')
-  dappHost.classList.add('with-warning')
+  websiteHost.classList.add('with-warning')
   rawView.classList.add('with-warning')
 }
 
 warningDismiss.addEventListener('click', () => {
   warningBanner.classList.add('hidden')
-  dappHost.classList.remove('with-warning')
+  websiteHost.classList.remove('with-warning')
   rawView.classList.remove('with-warning')
 })
 
 type Phase = 'idle' | 'loading' | 'ok' | 'error'
 
 let pageHasScripts = false
-let renderMode: 'dapp' | 'raw' = 'dapp'
+let renderMode: 'website' | 'raw' = 'website'
 let rawBlobUrl: string | null = null
 let listingBlobUrls: string[] = []
 let bundleCache: { key: string; data: Uint8Array } | null = null
@@ -55,7 +55,7 @@ function setPhase(phase: Phase) {
   loading.classList.toggle('hidden',     phase !== 'loading')
   errorPanel.classList.toggle('hidden',  phase !== 'error')
   if (phase === 'error') startRocketGame(errorPanel); else stopRocketGame()
-  dappHost.classList.toggle('dapp-visible', phase === 'ok' && renderMode === 'dapp')
+  websiteHost.classList.toggle('website-visible', phase === 'ok' && renderMode === 'website')
   rawView.classList.toggle('raw-visible', phase === 'ok' && renderMode === 'raw')
   verifyBadge.classList.toggle('hidden', phase !== 'ok')
   if (phase !== 'ok') heliosBadge.classList.add('hidden')
@@ -114,7 +114,7 @@ const broadcastEndpoint = document.getElementById('broadcast-endpoint') as HTMLB
 
 type BroadcastChoice = { useEndpoint: string | null }
 
-// Per-dapp remembered broadcast target (keyed by w3:// host). Default off — the checkbox
+// Per-website remembered broadcast target (keyed by w3:// host). Default off — the checkbox
 // is unchecked each time, so a choice is remembered only when the user opts in.
 const broadcastPrefs = new Map<string, 'endpoint' | 'verum'>()
 chrome.storage.session.get('broadcastPrefs').then(v => {
@@ -127,7 +127,7 @@ function persistBroadcastPrefs() {
   chrome.storage.session.set({ broadcastPrefs: obj }).catch(() => {})
 }
 
-// Grant the dapp's endpoint host at broadcast time. Common RPC hosts are already in
+// Grant the website's endpoint host at broadcast time. Common RPC hosts are already in
 // host_permissions (contains() → true, no prompt); anything else triggers Chrome's
 // optional-permission prompt, which needs the user gesture from the approval click.
 async function ensureHostPermission(endpoint: string): Promise<boolean> {
@@ -148,7 +148,7 @@ async function confirmBroadcast(rawTx: string, endpoint: string): Promise<Broadc
   let host = endpoint
   try { host = new URL(endpoint).host } catch {}
   broadcastEndpointHost.textContent = host
-  broadcastDesc.textContent = 'This dApp wants to broadcast a signed transaction.'
+  broadcastDesc.textContent = 'This website wants to broadcast a signed transaction.'
   broadcastRememberCb.checked = false
 
   // Best-effort decode of the signed tx so the user sees where funds go before approving.
@@ -276,12 +276,12 @@ function warmupHelios() {
     chrome.runtime.sendMessage({ type: 'warmup-helios', chainId: currentChainId }).catch(() => {})
   }
 }
-dappHost.addEventListener('mouseenter', warmupHelios)
+websiteHost.addEventListener('mouseenter', warmupHelios)
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') warmupHelios()
 })
 
-// When Helios finishes syncing, trigger a re-fetch in the dapp so data that
+// When Helios finishes syncing, trigger a re-fetch in the website so data that
 // was served by the plain RpcClient gets replaced with verified Helios reads.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'helios-syncing' && msg.chainId === currentChainId && !currentLocalMode && !currentTrustedReads) {
@@ -290,7 +290,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'helios-ready' && msg.chainId === currentChainId) {
     heliosIsReady = true
     heliosBadge.classList.add('hidden')
-    dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
+    websiteFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
   }
   if (msg.type === 'helios-oos' && msg.chainId === currentChainId && !currentLocalMode && !currentTrustedReads) {
     heliosIsReady = false
@@ -346,7 +346,7 @@ const FRAME_APPROVAL_METHODS = new Set([
 
 window.addEventListener('message', async (e) => {
   if (!e.data) return
-  if (e.source !== dappFrame.contentWindow) return
+  if (e.source !== websiteFrame.contentWindow) return
 
   if (e.data.type === 'w3-navigate' && typeof e.data.url === 'string') {
     // Remember the gateway fallback for this navigation: if the target turns out to be an
@@ -361,14 +361,14 @@ window.addEventListener('message', async (e) => {
   if (e.data.type === 'polyfill-ready') {
     if (!pageHasScripts) return
     if (heliosIsReady) {
-      dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
+      websiteFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
     } else {
       chrome.runtime.sendMessage({ type: 'helios-status', chainId: currentChainId })
         .then((s: { ready: boolean; syncing: boolean } | undefined) => {
           if (!s) return
           if (s.ready) {
             heliosIsReady = true
-            dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
+            websiteFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
           }
         })
         .catch(() => {})
@@ -381,7 +381,7 @@ window.addEventListener('message', async (e) => {
   if (e.data.type === 'eth-disconnect') {
     selectedWalletId = null
     selectedWalletName = 'wallet'
-    dappFrame.contentWindow?.postMessage(
+    websiteFrame.contentWindow?.postMessage(
       { type: 'wallet-event', method: 'accountsChanged', params: [] },
       '*',
     )
@@ -392,11 +392,11 @@ window.addEventListener('message', async (e) => {
   const { id, method, params } = e.data
 
   const sendBack = (result: unknown, error?: string) =>
-    dappFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error }, '*')
+    websiteFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error }, '*')
 
   // Raw-fetch broadcast: the polyfill's fetch shim rerouted an eth_sendRawTransaction that
-  // the dapp POSTed straight to a hardcoded RPC (e.g. mevblocker). The tx is already signed;
-  // we only need the user to approve WHERE it goes — the dapp's endpoint (preserving MEV
+  // the website POSTed straight to a hardcoded RPC (e.g. mevblocker). The tx is already signed;
+  // we only need the user to approve WHERE it goes — the website's endpoint (preserving MEV
   // protection) or verum's RPC set. `endpoint` is only ever set for these fetch-origin sends;
   // reads via fetch have no endpoint and fall through to the normal read path below.
   const endpoint: string | undefined = typeof e.data.endpoint === 'string' ? e.data.endpoint : undefined
@@ -412,7 +412,7 @@ window.addEventListener('message', async (e) => {
   }
 
   // eth_chainId can always be answered from the URL — no wallet connection needed.
-  // Returning "Not connected" here causes some dApps to reset their connect UI.
+  // Returning "Not connected" here causes some websites to reset their connect UI.
   if (method === 'eth_chainId') {
     sendBack('0x' + currentChainId.toString(16))
     return
@@ -465,13 +465,13 @@ window.addEventListener('message', async (e) => {
     if (!CONNECT_METHODS.has(method)) {
       sendBack(undefined, 'Not connected'); return
     }
-    // Dapps auto-retry immediately after a wallet rejection. Suppress the picker
+    // Websites auto-retry immediately after a wallet rejection. Suppress the picker
     // during a 1-second cooldown so cancelling doesn't reopen it right away.
     if (Date.now() < connectSuppressedUntil) {
       sendBack(undefined, 'User rejected the request.'); return
     }
     // If the picker is already open, queue this request instead of erroring.
-    // Erroring concurrent connect calls causes some dApps to reset their UI state.
+    // Erroring concurrent connect calls causes some websites to reset their UI state.
     if (connectInProgress) {
       await new Promise<void>((resolve) => {
         connectWaiters.push((result, error) => { sendBack(result, error); resolve() })
@@ -489,7 +489,7 @@ window.addEventListener('message', async (e) => {
     }
     // Always show picker even for a single wallet — this requires explicit user
     // intent before we send eth_requestAccounts to MetaMask, preventing the
-    // auto-retry loop when the dapp retries after a MetaMask rejection.
+    // auto-retry loop when the website retries after a MetaMask rejection.
     const picked = await pickWallet(wallets)
     connectInProgress = false
     if (!picked) {
@@ -537,21 +537,21 @@ window.addEventListener('message', async (e) => {
     }
   }
 
-  // wallet_revokePermissions = disconnect. Clear wallet state and notify the dapp.
+  // wallet_revokePermissions = disconnect. Clear wallet state and notify the website.
   if (!resp?.error && method === 'wallet_revokePermissions') {
     selectedWalletId = null
     selectedWalletName = 'wallet'
-    dappFrame.contentWindow?.postMessage(
+    websiteFrame.contentWindow?.postMessage(
       { type: 'wallet-event', method: 'accountsChanged', params: [] },
       '*',
     )
   }
 
-  // EIP-1193: emit accountsChanged so dapps that rely on the event update their UI.
+  // EIP-1193: emit accountsChanged so websites that rely on the event update their UI.
   // wallet_requestPermissions is an alternative connect method — extract accounts from
-  // the returned caveat so the dApp's accountsChanged listeners fire correctly.
+  // the returned caveat so the website's accountsChanged listeners fire correctly.
   if (!resp?.error && method === 'eth_requestAccounts' && Array.isArray(resp?.result)) {
-    dappFrame.contentWindow?.postMessage(
+    websiteFrame.contentWindow?.postMessage(
       { type: 'wallet-event', method: 'accountsChanged', params: resp.result },
       '*',
     )
@@ -562,7 +562,7 @@ window.addEventListener('message', async (e) => {
     const ethPerm = perms.find(p => p.parentCapability === 'eth_accounts')
     const accounts = ethPerm?.caveats?.find(c => c.type === 'restrictReturnedAccounts')?.value
     if (Array.isArray(accounts) && accounts.length > 0) {
-      dappFrame.contentWindow?.postMessage(
+      websiteFrame.contentWindow?.postMessage(
         { type: 'wallet-event', method: 'accountsChanged', params: accounts },
         '*',
       )
@@ -665,9 +665,9 @@ window.addEventListener('hashchange', () => {
 async function navigate(web3Url: string, attempt = 0) {
   const navToken = ++navSeq
 
-  // Hide stale dapp content immediately — before any await — so the old dapp
+  // Hide stale website content immediately — before any await — so the old website
   // never flashes through while storage is read or content arrives fast (local mode).
-  dappHost.classList.remove('dapp-visible')
+  websiteHost.classList.remove('website-visible')
   rawView.classList.remove('raw-visible')
 
   selectedWalletId = null
@@ -682,14 +682,14 @@ async function navigate(web3Url: string, attempt = 0) {
     const defaultChain = (stored.defaultChain as number | undefined) ?? 1
     parsedUrl = parseWeb3URL(web3Url, defaultChain)
     currentChainId = parsedUrl.chainId
-    // Host-only base for rewriting a dapp's self-referential share links (it builds them
-    // from location.*, which is about:srcdoc in the sandbox). No path/hash — the dapp
+    // Host-only base for rewriting a website's self-referential share links (it builds them
+    // from location.*, which is about:srcdoc in the sandbox). No path/hash — the website
     // appends its own.
     const host = parsedUrl.target.type === 'contract' ? parsedUrl.target.address
       : parsedUrl.target.type === 'ens' ? parsedUrl.target.name : ''
     currentPageUrl = `w3://${host}${parsedUrl.chainId !== 1 ? ':' + parsedUrl.chainId : ''}`
-    // Fragment (#…) is dapp client-side state (share links). Carry it to the sandbox so
-    // the dapp restores its state on load; parseWeb3URL strips it from resolution.
+    // Fragment (#…) is website client-side state (share links). Carry it to the sandbox so
+    // the website restores its state on load; parseWeb3URL strips it from resolution.
     const fragIdx = web3Url.indexOf('#')
     currentFragment = fragIdx !== -1 ? web3Url.slice(fragIdx) : ''
     heliosIsReady = false
@@ -699,12 +699,12 @@ async function navigate(web3Url: string, attempt = 0) {
     return
   }
 
-  renderMode = 'dapp'
+  renderMode = 'website'
   if (rawBlobUrl) { URL.revokeObjectURL(rawBlobUrl); rawBlobUrl = null }
   for (const u of listingBlobUrls) URL.revokeObjectURL(u)
   listingBlobUrls = []
   rawView.innerHTML = ''
-  dappFrame.contentWindow?.postMessage({ type: 'render', html: '' }, '*')  // clear stale dapp
+  websiteFrame.contentWindow?.postMessage({ type: 'render', html: '' }, '*')  // clear stale website
 
   // Same bundle, different path — render from cache without re-fetching or re-verifying.
   const cacheKey = bundleCacheKey(parsedUrl)
@@ -834,12 +834,12 @@ function applyVerification(msg: VerificationUpdate) {
 // ---------------------------------------------------------------------------
 
 // Sandbox is loaded eagerly (src set in HTML). We wait for its load event before
-// posting so dapp-sandbox.ts's message listener is guaranteed to be registered.
+// posting so website-sandbox.ts's message listener is guaranteed to be registered.
 const sandboxReady = new Promise<void>(resolve =>
-  dappFrame.addEventListener('load', () => resolve(), { once: true })
+  websiteFrame.addEventListener('load', () => resolve(), { once: true })
 )
 function sendToSandbox(msg: object) {
-  sandboxReady.then(() => dappFrame.contentWindow?.postMessage(msg, '*'))
+  sandboxReady.then(() => websiteFrame.contentWindow?.postMessage(msg, '*'))
 }
 
 function renderBundle(data: Uint8Array, web3Url: string) {
@@ -907,13 +907,13 @@ function renderBundle(data: Uint8Array, web3Url: string) {
     return
   }
 
-  const { html, assetMap } = buildDappHtml(files, file)
+  const { html, assetMap } = buildWebsiteHtml(files, file)
   renderContent(new TextEncoder().encode(html), 'text/html', assetMap)
 }
 
 function renderContent(data: Uint8Array, contentType: string, assetMap: Record<string, string> = {}) {
   warningBanner.classList.add('hidden')
-  dappHost.classList.remove('with-warning')
+  websiteHost.classList.remove('with-warning')
   rawView.classList.remove('with-warning')
 
   // Normalise: strip parameters (e.g. "text/plain; charset=utf-8" → "text/plain")
@@ -957,7 +957,7 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
     return
   }
 
-  renderMode = 'dapp'
+  renderMode = 'website'
   let html: string
   if (ct.includes('html')) {
     html = new TextDecoder().decode(data)
@@ -973,13 +973,13 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
   pageHasScripts = /<script[\s>]/i.test(html)
   // Detect the OS color scheme reliably here (extension page), and pass it to the sandbox.
   // In a freshly-created srcdoc iframe, matchMedia('(prefers-color-scheme:dark)') can
-  // return the wrong value at parse time, so dapps reading it at init (zSwap) sometimes
+  // return the wrong value at parse time, so websites reading it at init (zSwap) sometimes
   // render light. The sandbox shims matchMedia to return this value consistently.
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
   sendToSandbox({ type: 'render', html, assetMap, chainId: currentChainId, pageUrl: currentPageUrl, fragment: currentFragment, prefersDark })
   // Now that we know the page can make eth calls, start the live-head Helios
   // instance — it is no longer spawned during verification, so without this the
-  // dapp's first read would have to wait for the whole sync.
+  // website's first read would have to wait for the whole sync.
   if (pageHasScripts) warmupHelios()
   setPhase('ok')
 }
@@ -994,4 +994,8 @@ function showError(msg: string) {
   errorMessage.appendChild(document.createTextNode(' ' + msg))
   setPhase('error')
 }
-function esc(s: string) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
+// Full HTML escape — covers text AND attribute contexts. Quotes MUST be escaped because
+// esc() output is interpolated into quoted attributes .
+function esc(s: string) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+}

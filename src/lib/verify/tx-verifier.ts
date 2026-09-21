@@ -1,3 +1,4 @@
+import { w3log } from '../log'
 // Transaction inclusion proof via Patricia Merkle Trie reconstruction.
 //
 // All RPC calls go through IVerifiedRpc (Helios), which handles fallbacks,
@@ -346,17 +347,17 @@ export async function verifyTxInBlock(
   const computedHash = keccak256(encodeBlockHeader(block))
   if (computedHash.toLowerCase() !== blockHash.toLowerCase())
     throw new Error(`Block header hash mismatch: computed ${computedHash} ≠ ${blockHash}`)
-  console.log(`[w3] Block ${block.number}: header keccak256 ✓`)
+  w3log(`[w3] Block ${block.number}: header keccak256 ✓`)
 
   const items: Item[] = block.transactions.map((t, i) => ({ key: txKey(i), val: serializeTx(t) }))
   const computedRoot = computeTrieRoot(items)
   if (computedRoot.toLowerCase() !== block.transactionsRoot.toLowerCase())
     throw new Error(`Tx trie mismatch: computed ${computedRoot} ≠ ${block.transactionsRoot}`)
-  console.log(`[w3] Block ${block.number}: tx trie root ✓ (${block.transactions.length} txs)`)
+  w3log(`[w3] Block ${block.number}: tx trie root ✓ (${block.transactions.length} txs)`)
 
   const tx = block.transactions[txIndex]
   if (!tx) throw new Error(`No tx at index ${txIndex} in block ${blockHash}`)
-  console.log(`[w3] Block ${block.number}: tx[${txIndex}] = ${tx.hash} ✓`)
+  w3log(`[w3] Block ${block.number}: tx[${txIndex}] = ${tx.hash} ✓`)
 
   return { txHash: tx.hash, calldata: getBytes(tx.input) }
 }

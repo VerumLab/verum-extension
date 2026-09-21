@@ -21,7 +21,6 @@ export function startRocketGame(container: HTMLElement): void {
   box.innerHTML =
     '<canvas width="' + W + '" height="' + H + '"></canvas>' +
     '<div class="rg-bar">' +
-      '<span class="rg-hint">← → to dodge · any arrow to start</span>' +
       '<button class="rg-restart" hidden>↻ Restart</button>' +
     '</div>'
   container.insertBefore(box, container.firstChild)

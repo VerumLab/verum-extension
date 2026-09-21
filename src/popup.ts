@@ -121,7 +121,7 @@ function showProof(d: any) {
 
   set('pf-url', d.url ?? '—')
 
-  // Multi-chunk dapps have no single representative block or block hash. Keep their
+  // Multi-chunk websites have no single representative block or block hash. Keep their
   // individual locations in Chunks, but retain Source as a comparable summary.
   const chunks = d.chunks as Array<{ blockNumber: number; txIndex: number }> | undefined
   const multiChunk = !!chunks && chunks.length > 1

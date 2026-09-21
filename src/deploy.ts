@@ -5,7 +5,7 @@
 
 import { Interface, ensNormalize, namehash } from 'ethers'
 import { formatWeb3URL } from './lib/w3/url-parser.js'
-import { buildDappHtml } from './lib/w3/dapp-html.js'
+import { buildWebsiteHtml } from './lib/w3/website-html.js'
 import type { BundleFile } from './lib/w3/content.js'
 import {
   encodeBundle, encodeSingleFile, isSkippedPath, sniffType,
@@ -291,7 +291,7 @@ function renderPreview() {
     const bundleFiles: BundleFile[] = entries.map(e => ({ path: e.path, mimeType: e.mime, data: e.data }))
     const entry = bundleFiles.find(f => f.path === '/index.html')
     if (entry) {
-      const { html, assetMap } = buildDappHtml(bundleFiles, entry)
+      const { html, assetMap } = buildWebsiteHtml(bundleFiles, entry)
       sendToPreview(html, assetMap)
     } else {
       // No index.html — visitors get a clickable file listing; preview the same.
@@ -375,7 +375,7 @@ function previewFile(e: DeployFile, fromListing = false) {
   }
 }
 
-// The previewed dapp is fully interactive: reads go through the background's
+// The previewed website is fully interactive: reads go through the background's
 // verified eth-rpc path (same as the renderer), and wallet actions go to the
 // real wallet — connecting, signing and sending all work exactly as they will
 // once deployed, so the preview can be clicked through end to end.
@@ -403,7 +403,7 @@ window.addEventListener('message', async (e) => {
   // Answerable without a wallet — the URL's chain is authoritative.
   if (method === 'eth_chainId') { reply('0x' + (chain?.chainId ?? 1).toString(16)); return }
   if (method === 'eth_accounts') {
-    // Ask the wallet, so a switch made in MetaMask reaches the previewed dapp.
+    // Ask the wallet, so a switch made in MetaMask reaches the previewed website.
     if (!account) { reply([]); return }
     const live = await refreshAccount()
     reply(live ? [live] : [])
@@ -445,7 +445,7 @@ $('change-selection').addEventListener('click', () => {
   stepVerify.classList.add('hidden')
   stepName.classList.add('hidden')
   stepSelect.classList.remove('done')
-  sendToPreview('')  // clear stale dapp
+  sendToPreview('')  // clear stale website
   entries = []
   calldatas = []
   coords = []
@@ -518,7 +518,7 @@ async function showWalletPicker() {
 }
 
 // Modal picker: used wherever a wallet is needed outside the deploy step —
-// the dapp preview and the standalone "link an existing deployment" path.
+// the website preview and the standalone "link an existing deployment" path.
 function pickWalletModal(): Promise<{ id: string; name: string } | null> {
   return new Promise(async (resolve) => {
     const close = (v: { id: string; name: string } | null) => {

@@ -1,3 +1,4 @@
+import { w3log } from '../log'
 // Unified historical block verification.
 // Single chain: tx hash → execution block hash → era block roots (EIP-4788) → historical_summaries → Helios state root
 //
@@ -233,7 +234,7 @@ async function getAnchorStateRoot(
   for (const rpc of consensusRpcs) {
     try {
       const { root, stateRoot, msg } = await fetchVerifiedBeaconHeader(rpc, 'finalized')
-      console.log(`[w3] Consensus anchor: slot ${msg.slot} via ${rpc}`)
+      w3log(`[w3] Consensus anchor: slot ${msg.slot} via ${rpc}`)
       return { slot: Number(msg.slot), stateRoot, blockRoot: root }
     } catch { /* try next */ }
   }
@@ -269,7 +270,7 @@ async function confirmWithHelios(
         console.warn(`[w3] Helios EIP-4788 mismatch at slot ${probe}: ring=${rootFromRing} expected=${effectiveBeaconRoot}`)
         return false
       }
-      console.log('[w3] Helios confirmed via EIP-4788 ✓')
+      w3log('[w3] Helios confirmed via EIP-4788 ✓')
       return true
     }
     console.warn('[w3] Helios EIP-4788: no non-missed slot found within 64 slots')
@@ -393,7 +394,7 @@ async function tryEraTailStateSummary(
       console.warn(`[w3] era-tail reconstruct ≠ header state_root (${recon.stateRoot.slice(0,10)}… vs ${hdr.stateRoot.slice(0,10)}…) — full-state fallback`)
       return null
     }
-    console.log(`[w3] historical_summaries via era-tail + LC reconstruction ✓ (anchor slot ${anchorS}, no full-state download)`)
+    w3log(`[w3] historical_summaries via era-tail + LC reconstruction ✓ (anchor slot ${anchorS}, no full-state download)`)
     return { blob, effectiveStateRoot: recon.stateRoot, effectiveSlot: anchorS, effectiveBeaconRoot: hdr.root, fieldProof: recon.fieldProof }
   } catch (e) {
     console.warn(`[w3] era-tail reconstruction failed (${(e as Error).message}) — full-state fallback`)
@@ -405,12 +406,12 @@ async function tryEraTailStateSummary(
 // Public API
 // ---------------------------------------------------------------------------
 
-// Compact per-dapp proof stored in chrome.storage.local.
+// Compact per-website proof stored in chrome.storage.local.
 // merklePaths: one entry per target chunk (same order as the ENS record), each a
 //   base64-encoded concatenation of 13 × 32-byte sibling hashes proving that chunk's
 //   beacon block root is in its era's block_roots tree. null when the chunk was
 //   verified via the BeaconState rolling window (no era proof needed or produced).
-export interface DappProofData {
+export interface WebsiteProofData {
   merklePaths: (string | null)[]
 }
 
@@ -431,7 +432,7 @@ export interface BeaconVerifyOptions {
   eraFileUrls?: string[]
   parquetUrls?: string[]
   rpcBatchSizes?: Record<string, number>
-  cachedProof?: DappProofData
+  cachedProof?: WebsiteProofData
   eraBsrCache?: EraBsrCache
   // Dev mode: pin one source instead of the automatic fallback chain.
   eraSource?: EraSource
@@ -453,12 +454,12 @@ export interface BeaconVerification {
   heliosAnchored: boolean
   eraVerified: boolean
   stateHashVerified: boolean
-  proofData?: DappProofData
+  proofData?: WebsiteProofData
   newBsrCache?: EraBsrCache  // set when BeaconState was downloaded; replaces chain cache
 }
 
 // One verification target: an execution block that must be proven canonical.
-// Multi-chunk dapps pass one target per chunk (duplicates by slot are deduped).
+// Multi-chunk websites pass one target per chunk (duplicates by slot are deduped).
 export interface BeaconTarget {
   executionHash: string   // execution block hash the beacon body must contain
   blockTimestamp: number  // execution block timestamp → beacon slot
@@ -481,7 +482,7 @@ export async function verifyViaBeacon(
   const uniqueEras = [...new Set(slots.map(s => s.era))]
   const primary = slots[slots.length - 1]
 
-  console.log(`[w3] Verifying ${slots.length} slot(s): ${[...new Set(slots.map(s => s.slot))].join(', ')} (era${uniqueEras.length > 1 ? 's' : ''} ${uniqueEras.join(', ')})`)
+  w3log(`[w3] Verifying ${slots.length} slot(s): ${[...new Set(slots.map(s => s.slot))].join(', ')} (era${uniqueEras.length > 1 ? 's' : ''} ${uniqueEras.join(', ')})`)
 
   const execRpcs = executionRpcs?.length ? executionRpcs : []
   if (!execRpcs.length) throw new Error('No execution RPCs provided for era block root verification')
@@ -519,7 +520,7 @@ export async function verifyViaBeacon(
     if (allCovered) {
       const resolvedHelios = heliosRpc instanceof Promise ? await heliosRpc : heliosRpc
       if (!resolvedHelios?.isHeliosBacked()) {
-        console.log('[w3] Helios not available — skipping BSR cache, re-downloading BeaconState')
+        w3log('[w3] Helios not available — skipping BSR cache, re-downloading BeaconState')
       } else {
         try {
           const ts = slotToTimestamp(eraBsrCache.effectiveSlot + 1, chainId)
@@ -529,7 +530,7 @@ export async function verifyViaBeacon(
           )
           const rootFromRing = result.length === 66 ? result : '0x' + result.slice(-64)
           if (rootFromRing.toLowerCase() !== eraBsrCache.effectiveBeaconRoot.toLowerCase()) {
-            console.log('[w3] EIP-4788 root mismatch — BSR cache expired, re-downloading')
+            w3log('[w3] EIP-4788 root mismatch — BSR cache expired, re-downloading')
           } else if (!verifyHistoricalSummariesFieldProof(eraBsrCache.histSummaries, eraBsrCache.fieldProof, eraBsrCache.stateRoot)) {
             console.warn('[w3] BSR cache field proof mismatch — re-downloading')
           } else {
@@ -538,10 +539,10 @@ export async function verifyViaBeacon(
               const idx = historicalSummariesIndex(e, chainId)
               bsrByEra.set(e, hexlify(raw.slice(idx * 64, idx * 64 + 32)))
             }
-            console.log('[w3] EIP-4788 + field proof verified — skipping BeaconState download ✓')
+            w3log('[w3] EIP-4788 + field proof verified — skipping BeaconState download ✓')
           }
         } catch (e) {
-          console.log(`[w3] EIP-4788 check failed (${(e as Error).message}) — re-downloading`)
+          w3log(`[w3] EIP-4788 check failed (${(e as Error).message}) — re-downloading`)
         }
       }
     }
@@ -564,7 +565,7 @@ export async function verifyViaBeacon(
       && !eraFilesDisabled
     // Only historical_summaries falls back to the full-state download here; block_roots
     // still come from parquet/exec-headers per their own strategy selection below.
-    if (eraFilesDisabled) console.log('[w3] era-tail skipped — era files disabled; historical_summaries via full-state download')
+    if (eraFilesDisabled) w3log('[w3] era-tail skipped — era files disabled; historical_summaries via full-state download')
     const [eraTail, primaryRange] = await Promise.all([
       wantEraTail ? tryEraTailStateSummary(consensusRpcs, chainId, anchor.slot, options?.checkpointUrls, options?.eraFileUrls) : Promise.resolve(null),
       findEraBlockRange(execRpcs, primary.era * 8192, chainId),
@@ -636,7 +637,7 @@ export async function verifyViaBeacon(
   for (const e of uniqueEras) {
     const needed = slots.some((s, i) => s.era === e && !blockRootsAtSlots[s.slot] && !cachedPathFor(i))
     if (!needed) {
-      console.log(`[w3] Era ${e}: all targets covered by rolling window / cached proofs — skipping era download`)
+      w3log(`[w3] Era ${e}: all targets covered by rolling window / cached proofs — skipping era download`)
       continue
     }
     const bsr = bsrByEra.get(e)
@@ -652,7 +653,7 @@ export async function verifyViaBeacon(
     if (forced) {
       // Dev mode: run exactly the requested source and let it fail if it can't
       // serve this era — falling back would hide the thing being tested.
-      console.log(`[w3] Era ${e}: dev mode — forcing ${forced}`)
+      w3log(`[w3] Era ${e}: dev mode — forcing ${forced}`)
       if (forced !== 'exec-headers' && needExecHeaders) {
         throw new Error(
           `Dev mode: era ${e} is too recent for ${forced} — era files and parquet are only ` +
@@ -677,11 +678,11 @@ export async function verifyViaBeacon(
       eraBlockRoots = await fetchEraBlockRootsFromEraFile(e + 1, chainId, bsr, options?.eraFileUrls)
     }
     if (!eraBlockRoots && !needExecHeaders && useParquet) {
-      console.log(`[w3] Era ${e}: trying parquet (ethpandaops xatu)`)
+      w3log(`[w3] Era ${e}: trying parquet (ethpandaops xatu)`)
       eraBlockRoots = await fetchEraBlockRootsFromParquet(e, chainId, bsr, options?.parquetUrls)
     }
     if (!eraBlockRoots) {
-      console.log(`[w3] Era ${e}: falling back to exec headers`)
+      w3log(`[w3] Era ${e}: falling back to exec headers`)
       eraBlockRoots = await fetchEraBlockRootsFromExecHeaders(
         execRpcs, e, chainId, bsr, range.startNum, range.endNum, options?.rpcBatchSizes,
       )
@@ -721,12 +722,12 @@ export async function verifyViaBeacon(
         if (windowRoot) {
           if (root.toLowerCase() !== windowRoot.toLowerCase())
             throw new Error(`Beacon header root ${root} ≠ BeaconState block_roots[${s.slotInEra}] ${windowRoot}`)
-          console.log(`[w3] Beacon header at slot ${s.slot} verified against BeaconState block_roots ✓`)
+          w3log(`[w3] Beacon header at slot ${s.slot} verified against BeaconState block_roots ✓`)
         } else if (eraRoots) {
           const expected = hexlify(eraRoots[s.slotInEra])
           if (root.toLowerCase() !== expected.toLowerCase())
             throw new Error(`Beacon header root ${root} ≠ era block_roots[${s.slotInEra}] ${expected}`)
-          console.log(`[w3] Beacon header at slot ${s.slot} verified against era block_roots ✓`)
+          w3log(`[w3] Beacon header at slot ${s.slot} verified against era block_roots ✓`)
           merklePaths[i] = encodeMerklePath(merkleProof(eraRoots, s.slotInEra))
         } else if (cached) {
           const bsr = bsrByEra.get(s.era)
@@ -735,7 +736,7 @@ export async function verifyViaBeacon(
           const computed = hexlify(merkleVerify(getBytes(root), s.slotInEra, path))
           if (computed.toLowerCase() !== bsr.toLowerCase())
             throw new Error(`Merkle proof mismatch: computed ${computed} ≠ blockSummaryRoot ${bsr}`)
-          console.log(`[w3] Beacon header at slot ${s.slot} verified against cached Merkle proof ✓`)
+          w3log(`[w3] Beacon header at slot ${s.slot} verified against cached Merkle proof ✓`)
         } else {
           throw new Error(`No verification source for slot ${s.slot}`)
         }
@@ -767,7 +768,7 @@ export async function verifyViaBeacon(
     rootBySlot.set(s.slot, verifiedBeaconRoot)
     execHashBySlot.set(s.slot, executionHash)
   }
-  console.log(`[w3] execution_block_hash verified end-to-end for ${execHashBySlot.size} block(s) ✓`)
+  w3log(`[w3] execution_block_hash verified end-to-end for ${execHashBySlot.size} block(s) ✓`)
 
   // Step 6: Helios anchor — once for the whole batch.
   // BSR cache hit: Helios already confirmed stateRoot in step 2 — mark anchored.
@@ -775,13 +776,13 @@ export async function verifyViaBeacon(
   let heliosAnchored = false
   if (eraBsrHit) {
     heliosAnchored = true
-    console.log('[w3] Helios anchor: ✓ confirmed (EIP-4788 cache hit)')
+    w3log('[w3] Helios anchor: ✓ confirmed (EIP-4788 cache hit)')
   } else {
     const resolvedHelios = heliosRpc instanceof Promise ? await heliosRpc : heliosRpc
     if (resolvedHelios && effectiveBeaconRoot) {
       heliosAnchored = await confirmWithHelios(resolvedHelios, effectiveBeaconRoot, effectiveSlot, chainId)
     }
-    console.log(`[w3] Helios anchor: ${heliosAnchored ? '✓ confirmed' : 'not confirmed (unanchored result)'}`)
+    w3log(`[w3] Helios anchor: ${heliosAnchored ? '✓ confirmed' : 'not confirmed (unanchored result)'}`)
   }
 
   return {

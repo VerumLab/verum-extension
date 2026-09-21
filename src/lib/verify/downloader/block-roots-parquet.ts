@@ -1,3 +1,4 @@
+import { w3log } from '../../log'
 // Era block_roots via ethpandaops xatu canonical_beacon_block parquet exports.
 // Faster than era files for recent-but-not-current eras since rows are queried
 // directly rather than range-fetched and decompressed; unavailable for the
@@ -82,19 +83,19 @@ export async function fetchEraBlockRootsFromParquet(
     for (const d of eraDates(eraStartSlot, chainId)) {
       try {
         const rows = await fetchParquetDayRoots(`${base}/${d}.parquet`, eraStartSlot, eraEndSlot)
-        console.log(`[w3] Parquet ${d}: ${rows.length} rows in era range`)
+        w3log(`[w3] Parquet ${d}: ${rows.length} rows in era range`)
         for (const row of rows) {
           if (!slotSet.has(Number(row.slot))) { slotSet.add(Number(row.slot)); allRows.push(row) }
         }
       } catch (e) {
-        console.log(`[w3] Parquet ${d}: ${(e as Error).message}`)
+        w3log(`[w3] Parquet ${d}: ${(e as Error).message}`)
       }
     }
     if (allRows.length > 0) break  // first base that returned data wins
   }
 
   if (allRows.length === 0) {
-    console.log(`[w3] Parquet: no data for era ${era}`)
+    w3log(`[w3] Parquet: no data for era ${era}`)
     return null
   }
 
@@ -120,6 +121,6 @@ export async function fetchEraBlockRootsFromParquet(
     console.warn(`[w3] Parquet: block_summary_root mismatch (era may be incomplete)`)
     return null
   }
-  console.log(`[w3] Parquet: era ${era} block_roots verified ✓`)
+  w3log(`[w3] Parquet: era ${era} block_roots verified ✓`)
   return finalRoots
 }

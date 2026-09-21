@@ -43,18 +43,18 @@
     <button id="frame-toast-close">✕</button>
   </div>
 
-  <!-- Dapp renders here; div is the fixed viewport element, iframe is its block child.
+  <!-- Website renders here; div is the fixed viewport element, iframe is its block child.
        Sandbox src is set eagerly so it loads while the div is still hidden. -->
-  <div id="dapp-host">
-    <iframe id="dapp-frame" src="dapp-sandbox.html" allow="clipboard-write"></iframe>
+  <div id="website-host">
+    <iframe id="website-frame" src="website-sandbox.html" allow="clipboard-write"></iframe>
   </div>
 
-  <!-- Raw content viewer for non-dapp files (PDF, plain text, binary).
+  <!-- Raw content viewer for non-website files (PDF, plain text, binary).
        No sandbox so Chrome's built-in PDF viewer can activate inside a child iframe.
-       MUST NEVER receive text/html or */javascript content — those go to dapp-host. -->
+       MUST NEVER receive text/html or */javascript content — those go to website-host. -->
   <div id="raw-view"></div>
 
-  <!-- Transparent click-blocker; dApp visible underneath. -->
+  <!-- Transparent click-blocker; website visible underneath. -->
   <div id="unverified-gate" class="hidden"></div>
 
   <!-- Accept modal — appears when user clicks the gate -->
@@ -62,7 +62,7 @@
     <div id="unverified-modal-backdrop"></div>
     <div id="unverified-modal-box">
       <span id="unverified-modal-icon">⚠</span>
-      <p id="unverified-modal-msg">This dApp is still being verified. Content authenticity is not yet confirmed.</p>
+      <p id="unverified-modal-msg">This website is still being verified. Content authenticity is not yet confirmed.</p>
       <div id="unverified-modal-actions">
         <button id="unverified-modal-cancel">Cancel</button>
         <button id="unverified-modal-accept">Continue anyway</button>
@@ -76,9 +76,9 @@
     <div id="broadcast-box">
       <span id="broadcast-icon">📡</span>
       <h3 id="broadcast-title">Broadcast transaction?</h3>
-      <p id="broadcast-desc">This dApp wants to broadcast a signed transaction.</p>
+      <p id="broadcast-desc">This website wants to broadcast a signed transaction.</p>
       <div id="broadcast-details"></div>
-      <label id="broadcast-remember"><input type="checkbox" id="broadcast-remember-cb" /> Remember for this dApp</label>
+      <label id="broadcast-remember"><input type="checkbox" id="broadcast-remember-cb" /> Remember for this website</label>
       <div id="broadcast-actions">
         <button id="broadcast-cancel">Cancel</button>
         <button id="broadcast-verum">Via verum RPCs</button>

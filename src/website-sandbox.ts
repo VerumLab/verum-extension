@@ -1,8 +1,8 @@
-import { DAPP_BASE } from './lib/w3/dapp-html.js'
+import { WEBSITE_BASE } from './lib/w3/website-html.js'
 
-// Hostname of DAPP_BASE ('dapp.w3fs'), for the same-origin checks in the injected srcdoc JS.
-// Single source of truth — DAPP_BASE is defined once in dapp-html.ts.
-const DAPP_HOST = new URL(DAPP_BASE).hostname
+// Hostname of WEBSITE_BASE ('website.w3fs'), for the same-origin checks in the injected srcdoc JS.
+// Single source of truth — WEBSITE_BASE is defined once in website-html.ts.
+const WEBSITE_HOST = new URL(WEBSITE_BASE).hostname
 
 type RenderMessage = {
   type: 'render'
@@ -21,8 +21,8 @@ type BridgeMessage = {
 
 let frame = document.getElementById('frame') as HTMLIFrameElement
 
-// Relay eth-request from the dapp iframe up to renderer.html, and eth-response
-// back down from renderer.html into the dapp iframe.
+// Relay eth-request from the website iframe up to renderer.html, and eth-response
+// back down from renderer.html into the website iframe.
 window.addEventListener('message', (event: MessageEvent<BridgeMessage | RenderMessage>) => {
   if (!event.data) return
 
@@ -47,9 +47,9 @@ window.addEventListener('message', (event: MessageEvent<BridgeMessage | RenderMe
   }
 })
 
-// Polyfills injected before any dApp code runs.
+// Polyfills injected before any website code runs.
 // The iframe intentionally has an opaque sandbox origin so the manifest sandbox
-// can allow inline dapp scripts. Storage APIs are shimmed before app code runs.
+// can allow inline website scripts. Storage APIs are shimmed before app code runs.
 function makePolyfill(chainId: number, pageUrl = '', fragment = '', prefersDark = false): string {
   const chainIdHex = '0x' + chainId.toString(16)
   return makePolyfillScript(chainIdHex, pageUrl, fragment, prefersDark)
@@ -61,7 +61,7 @@ const _fr = JSON.stringify(fragment)     // #… state to restore, safely embedd
 const _pd = prefersDark ? 'true' : 'false'
 return '<scr' + 'ipt>(function(){' +
   // matchMedia shim: a freshly-created srcdoc iframe can evaluate prefers-color-scheme to
-  // the wrong value at parse time, so dapps reading it synchronously at init (zSwap) render
+  // the wrong value at parse time, so websites reading it synchronously at init (zSwap) render
   // light at random. Return the renderer's reliably-detected OS scheme for color-scheme
   // queries; delegate every other query (pointer:coarse, resize, …) to the native impl.
   'try{var _mm=window.matchMedia?window.matchMedia.bind(window):null;var _pd=' + _pd + ';' +
@@ -72,34 +72,50 @@ return '<scr' + 'ipt>(function(){' +
       'return _mm?_mm(q):{matches:false,media:q,addListener:function(){},removeListener:function(){},' +
         'addEventListener:function(){},removeEventListener:function(){}};};' +
   '}catch(e){}' +
-  'function MS(){var s={};return{' +
-    'get length(){return Object.keys(s).length},' +
-    'key:function(i){return Object.keys(s)[i]||null},' +
-    'getItem:function(k){k=String(k);return Object.prototype.hasOwnProperty.call(s,k)?s[k]:null},' +
-    'setItem:function(k,v){s[String(k)]=String(v)},' +
-    'removeItem:function(k){delete s[String(k)]},' +
-    'clear:function(){s={}}' +
-  '}}' +
-  'try{Object.defineProperty(window,"localStorage",{value:MS(),configurable:true});}catch(e){}' +
-  'try{Object.defineProperty(window,"sessionStorage",{value:MS(),configurable:true});}catch(e){}' +
-  // Restore share-link state: the dapp reads location.hash on load, but about:srcdoc has
-  // an empty hash. Set it (from the w3:// URL fragment) before the dapp's scripts run so it
+  // In-memory localStorage/sessionStorage shim, persisted to window.name so it
+  // survives a same-frame reload the way a real browser keeps storage across
+  // location.reload() — without touching the extension's real storage. A fresh
+  // frame (a new navigation) starts with a fresh window.name, so state is scoped
+  // to the page's lifetime. Wrapped in a Proxy so websites that use property
+  // access (s[key], delete s[key]) work alongside getItem/setItem.
+  'function MS(nk){var s={};try{s=JSON.parse(window.name||"{}")[nk]||{}}catch(e){}' +
+    'function P(){try{var a={};try{a=JSON.parse(window.name||"{}")}catch(e){}a[nk]=s;window.name=JSON.stringify(a)}catch(e){}}' +
+    'var api={' +
+      'get length(){return Object.keys(s).length},' +
+      'key:function(i){return Object.keys(s)[i]||null},' +
+      'getItem:function(k){k=String(k);return Object.prototype.hasOwnProperty.call(s,k)?s[k]:null},' +
+      'setItem:function(k,v){s[String(k)]=String(v);P()},' +
+      'removeItem:function(k){delete s[String(k)];P()},' +
+      'clear:function(){s={};P()}' +
+    '};' +
+    'return new Proxy(api,{' +
+      'get:function(t,p){if(p in t)return t[p];return Object.prototype.hasOwnProperty.call(s,p)?s[p]:undefined},' +
+      'set:function(t,p,v){if(p in t){t[p]=v}else{s[String(p)]=String(v);P()}return true},' +
+      'deleteProperty:function(t,p){if(Object.prototype.hasOwnProperty.call(s,p)){delete s[p];P()}return true},' +
+      'has:function(t,p){return (p in t)||Object.prototype.hasOwnProperty.call(s,p)},' +
+      'ownKeys:function(){return Object.keys(s)},' +
+      'getOwnPropertyDescriptor:function(t,p){if(Object.prototype.hasOwnProperty.call(s,p))return{value:s[p],writable:true,enumerable:true,configurable:true};return undefined}' +
+    '})}' +
+  'try{Object.defineProperty(window,"localStorage",{value:MS("l"),configurable:true});}catch(e){}' +
+  'try{Object.defineProperty(window,"sessionStorage",{value:MS("s"),configurable:true});}catch(e){}' +
+  // Restore share-link state: the website reads location.hash on load, but about:srcdoc has
+  // an empty hash. Set it (from the w3:// URL fragment) before the website's scripts run so it
   // rehydrates (#token=ETH&out=wstETH). Same-document, fires hashchange — harmless.
   'var _FR=' + _fr + ';' +
   // replaceState, NOT location.hash=: an iframe hash change pushes an entry onto the
   // browser session history, so setting it directly made Back require extra clicks to
-  // unwind invisible iframe entries. replaceState updates location.hash (which the dapp
+  // unwind invisible iframe entries. replaceState updates location.hash (which the website
   // reads on load) without adding history.
   'try{if(_FR)history.replaceState(history.state,"",_FR);}catch(e){}' +
   // Clipboard write shim: the async Clipboard API is blocked by Permissions Policy in
   // this sandboxed (opaque-origin) srcdoc iframe, so navigator.clipboard.writeText()
   // rejects. Fall back to the legacy execCommand("copy"), which works inside a sandboxed
   // iframe during a user gesture. Only WRITE is shimmed — clipboard reading stays off.
-  // Also rewrite the dapp's self-referential share links: it builds them from location.*,
+  // Also rewrite the website's self-referential share links: it builds them from location.*,
   // which is about:srcdoc here, so they come out as "nullsrcdoc#…" / "about:srcdoc#…".
   // Those two markers are impossible in a legitimate copy (pure opaque-origin artifacts),
   // so on an exact startsWith match, swap the broken base for the real w3:// URL, keeping
-  // the trailing #hash/?query the dapp appended. Anything else is copied through untouched.
+  // the trailing #hash/?query the website appended. Anything else is copied through untouched.
   'var _PU=' + _pu + ';' +
   'function _fixLink(t){t=String(t);if(!_PU)return t;' +
     'if(t.indexOf("nullsrcdoc")===0)return _PU+t.slice(10);' +
@@ -124,7 +140,7 @@ return '<scr' + 'ipt>(function(){' +
   // which is not a valid base for relative URL resolution.
   'var _U=window.URL;' +
   'function PU(u,b){' +
-    'if(!b||b==="about:srcdoc"||b===location.href)b="' + DAPP_BASE + '";' +
+    'if(!b||b==="about:srcdoc"||b===location.href)b="' + WEBSITE_BASE + '";' +
     'return new _U(u,b);' +
   '}' +
   'PU.createObjectURL=_U.createObjectURL.bind(_U);' +
@@ -135,7 +151,7 @@ return '<scr' + 'ipt>(function(){' +
   'var _cbs={};' +
   // Shared bridge: post one JSON-RPC method to the renderer and resolve when the
   // matching eth-response returns. `endpoint` is carried only for raw broadcasts (see
-  // the fetch shim) so the renderer can offer to keep the dapp\'s chosen RPC.
+  // the fetch shim) so the renderer can offer to keep the website\'s chosen RPC.
   'function _send(method,params,endpoint){' +
     'return new Promise(function(res,rej){' +
       'var id=(Math.random()*1e17).toString(36);' +
@@ -161,7 +177,7 @@ return '<scr' + 'ipt>(function(){' +
     'disconnect:function(){window.parent.postMessage({type:"eth-disconnect"},"*");}' +
   '};' +
   'window.ethereum=_eth;' +
-  // fetch shim: many dapps bypass window.ethereum and POST JSON-RPC straight to a
+  // fetch shim: many websites bypass window.ethereum and POST JSON-RPC straight to a
   // hardcoded RPC (tenderly/drpc/mevblocker/…) via fetch. Those requests are blocked by
   // the sandbox CSP (default-src does not allow external connect-src), so every read
   // fails. Detect a JSON-RPC POST (single or batch) and reroute it through the same
@@ -239,7 +255,7 @@ return '<scr' + 'ipt>(function(){' +
   // External link interceptor: open http/https links in a new tab; route w3:// links through the extension.
   // On an SVG <a>, .href is an SVGAnimatedString (not a string) — reading it directly
   // made new URL() throw, so links inside inline SVG fell through to default navigation
-  // and replaced the dapp frame. Take the string form for both HTML and SVG anchors.
+  // and replaced the website frame. Take the string form for both HTML and SVG anchors.
   'document.addEventListener("click",function(e){' +
     'var t=e.target;' +
     'var a=t.closest?t.closest("a"):null;' +
@@ -247,18 +263,18 @@ return '<scr' + 'ipt>(function(){' +
     'if(!a)return;' +
     'var h=(typeof a.href==="string")?a.href:(a.href&&a.href.baseVal)||a.getAttribute("xlink:href")||a.getAttribute("href");' +
     'if(!h)return;' +
-    'try{var u=new URL(h,"' + DAPP_BASE + '");' +
+    'try{var u=new URL(h,"' + WEBSITE_BASE + '");' +
       // Same-document hash navigation (SPA hash router). A srcdoc iframe\'s base URL is the
-      // containing frame (dapp-sandbox.html), so <a href="#/route"> resolves to
-      // dapp-sandbox.html#/route — a default click NAVIGATES the frame there (blank page)
+      // containing frame (website-sandbox.html), so <a href="#/route"> resolves to
+      // website-sandbox.html#/route — a default click NAVIGATES the frame there (blank page)
       // instead of a same-document hash change. Detect a link that differs from the current
-      // document only by its #fragment and apply it as a local hash change, so the dapp\'s
+      // document only by its #fragment and apply it as a local hash change, so the website\'s
       // router reacts in place. Uses document.baseURI so it matches however the anchor resolved.
       'try{var _b=new URL(document.baseURI);var _hh=new URL(h,document.baseURI);' +
         // Same-document (origin+path+query match, fragment may differ or be empty): covers
         // <a href="#/route">, <a href="#"> and <a href=""> — all of which would otherwise
-        // cross-navigate the frame to dapp-sandbox.html (blank). Apply as a local hash change
-        // so the dapp\'s hash router reacts in place; an unchanged hash still re-fires
+        // cross-navigate the frame to website-sandbox.html (blank). Apply as a local hash change
+        // so the website\'s hash router reacts in place; an unchanged hash still re-fires
         // hashchange so re-clicking the active route re-runs the router.
         'if(_hh.origin===_b.origin&&_hh.pathname===_b.pathname&&_hh.search===_b.search){' +
           'e.preventDefault();' +
@@ -266,7 +282,7 @@ return '<scr' + 'ipt>(function(){' +
           'else window.dispatchEvent(new HashChangeEvent("hashchange"));' +
           'return;' +
         '}}catch(_e){}' +
-      'if(u.hostname==="' + DAPP_HOST + '")return;' +
+      'if(u.hostname==="' + WEBSITE_HOST + '")return;' +
       'if(u.protocol==="w3:"){' +
         'e.preventDefault();window.parent.postMessage({type:"w3-navigate",url:h},"*");return;' +
       '}' +
@@ -287,7 +303,7 @@ return '<scr' + 'ipt>(function(){' +
 }
 
 // Asset map polyfill: intercept img.src assignments made by JS and replace
-// https://dapp.w3fs/* URLs with pre-built data: URIs from the bundle.
+// https://website.w3fs/* URLs with pre-built data: URIs from the bundle.
 function makeAssetPolyfill(assetMap: Record<string, string>) {
   if (!Object.keys(assetMap).length) return ''
   const mapJson = JSON.stringify(assetMap)
@@ -324,7 +340,7 @@ window.addEventListener('message', (event: MessageEvent<RenderMessage>) => {
 
   // Recreate the iframe before loading, instead of reassigning srcdoc. Reassigning
   // srcdoc on an already-loaded iframe pushes a browser session-history entry, so a
-  // clear-then-render (two assignments) plus the dapp's own hash writes made Back
+  // clear-then-render (two assignments) plus the website's own hash writes made Back
   // require several clicks to unwind invisible iframe entries. A fresh iframe's first
   // load is a REPLACEMENT (no history push), keeping Back a single click per page.
   const fresh = frame.cloneNode(false) as HTMLIFrameElement  // copies id/sandbox/allow/style

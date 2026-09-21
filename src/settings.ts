@@ -8,13 +8,13 @@ const defaultChainSel = document.getElementById('default-chain-select') as HTMLS
 const clearCacheBtn   = document.getElementById('clear-cache-btn') as HTMLButtonElement
 const cacheInfo       = document.getElementById('cache-info') as HTMLSpanElement
 
-// "Helios reads" switch — ON means dApp runtime reads go through Helios (verified, slow);
-// OFF means they're served from the fast RPC (trusted, fast — needed by read-heavy dApps).
+// "Helios reads" switch — ON means website runtime reads go through Helios (verified, slow);
+// OFF means they're served from the fast RPC (trusted, fast — needed by read-heavy websites).
 // Backed by the session-scoped `trustedReads` flag (its inverse), so it resets to the
 // default (trusted reads — Helios OFF) on browser restart. Content is always Helios-verified
-// at load regardless; this switch only affects the dApp's runtime reads.
+// at load regardless; this switch only affects the website's runtime reads.
 const heliosReadsSwitch = document.getElementById('helios-reads') as HTMLInputElement
-// Default is trusted RPC (Helios reads OFF) for max dApp compatibility — the switch is on
+// Default is trusted RPC (Helios reads OFF) for max website compatibility — the switch is on
 // only when the user has explicitly enabled Helios-verified reads (trustedReads === false).
 chrome.storage.session.get('trustedReads').then(v => { heliosReadsSwitch.checked = v.trustedReads === false })
 heliosReadsSwitch.addEventListener('change', () => {
@@ -30,11 +30,11 @@ document.getElementById('faq-link')!.addEventListener('click', (e) => {
 
 async function updateCacheInfo() {
   const [local, sync, bytesInUse] = await Promise.all([
-    chrome.storage.local.get(['dapp_proof_cache', 'era_bsr_cache']),
+    chrome.storage.local.get(['website_proof_cache', 'era_bsr_cache']),
     chrome.storage.sync.get('chains'),
-    chrome.storage.local.getBytesInUse(['dapp_proof_cache', 'era_bsr_cache']),
+    chrome.storage.local.getBytesInUse(['website_proof_cache', 'era_bsr_cache']),
   ])
-  const dapp_proof_cache = local.dapp_proof_cache as Record<string, unknown> | undefined
+  const website_proof_cache = local.website_proof_cache as Record<string, unknown> | undefined
   const era_bsr_cache = local.era_bsr_cache as
     Record<number, { histSummaries?: string; effectiveSlot?: number }> | undefined
   const chainNames: Record<number, string> = {}
@@ -43,17 +43,17 @@ async function updateCacheInfo() {
     chainNames[ch.chainId] = ch.name
   }
 
-  // Group dapp proofs by chainId
-  const dappsPerChain: Record<number, number> = {}
-  for (const proof of Object.values(dapp_proof_cache ?? {})) {
+  // Group website proofs by chainId
+  const websitesPerChain: Record<number, number> = {}
+  for (const proof of Object.values(website_proof_cache ?? {})) {
     const p = proof as { chainId?: number }
     const id = p.chainId ?? 0
-    dappsPerChain[id] = (dappsPerChain[id] ?? 0) + 1
+    websitesPerChain[id] = (websitesPerChain[id] ?? 0) + 1
   }
 
   // Collect all chainIds across both caches
   const allChainIds = new Set<number>([
-    ...Object.keys(dappsPerChain).map(Number),
+    ...Object.keys(websitesPerChain).map(Number),
     ...Object.keys(era_bsr_cache ?? {}).map(Number),
   ])
 
@@ -62,8 +62,8 @@ async function updateCacheInfo() {
     const name = chainNames[chainId] ?? (chainId === 0 ? 'unknown chain' : `chain ${chainId}`)
     const parts: string[] = []
 
-    const dapps = dappsPerChain[chainId]
-    if (dapps) parts.push(`${dapps} dapp${dapps === 1 ? '' : 's'}`)
+    const websites = websitesPerChain[chainId]
+    if (websites) parts.push(`${websites} website${websites === 1 ? '' : 's'}`)
 
     const bsr = era_bsr_cache?.[chainId]
     if (bsr?.histSummaries) {
@@ -86,7 +86,7 @@ async function updateCacheInfo() {
 }
 
 clearCacheBtn.addEventListener('click', async () => {
-  await chrome.storage.local.remove(['dapp_proof_cache', 'era_bsr_cache'])
+  await chrome.storage.local.remove(['website_proof_cache', 'era_bsr_cache'])
   updateCacheInfo()
 })
 

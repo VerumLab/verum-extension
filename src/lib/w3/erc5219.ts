@@ -1,3 +1,4 @@
+import { w3log } from '../log'
 // ERC-5219 / ERC-8244 contract-served content reads for web3:// (ERC-4804) URLs.
 //
 // A name (or bare address) can point at a contract that *serves* a web page from a
@@ -99,7 +100,7 @@ export async function fetchContractContent(
   block: string,
 ): Promise<ContractContent> {
   const mode = await readResolveMode(rpc, address, block)
-  console.log(`[w3] erc5219 ${address} resolveMode="${mode}"`)
+  w3log(`[w3] erc5219 ${address} resolveMode="${mode}"`)
 
   // ERC-5219 request(resource, params) → (status, body, headers). Returns null if the
   // contract doesn't implement it (reverts / empty); rethrows infra errors.
@@ -122,7 +123,7 @@ export async function fetchContractContent(
       else if (key === 'cache-control') cacheControl = h[1]
     }
     const enc = new TextEncoder().encode(body)
-    console.log(`[w3] erc5219 request() ok — ${enc.length} bytes, ct="${contentType}", cc="${cacheControl ?? ''}"`)
+    w3log(`[w3] erc5219 request() ok — ${enc.length} bytes, ct="${contentType}", cc="${cacheControl ?? ''}"`)
     return { body: enc, contentType, cacheControl, statusCode, mode: '5219' }
   }
 
@@ -135,7 +136,7 @@ export async function fetchContractContent(
     let decoded
     try { decoded = iface.decodeFunctionResult('html', res) } catch { return null }
     const enc = new TextEncoder().encode(decoded[0] as string)
-    console.log(`[w3] erc5219 html() ok — ${enc.length} bytes`)
+    w3log(`[w3] erc5219 html() ok — ${enc.length} bytes`)
     return { body: enc, contentType: 'text/html; charset=utf-8', mode: 'html' }
   }
 
