@@ -5,7 +5,7 @@ import { getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/verify/tx-
 import type { RpcBlockFull } from './lib/verify/tx-verifier.js'
 import { getCalldataViaPortal } from './lib/rpc/portal.js'
 import { parseCalldata, assembleContent } from './lib/w3/content.js'
-import { resolveEns, resolveName, nameIsIpfs, compareEnsChunks } from './lib/w3/name-resolver.js'
+import { resolveName, nameIsIpfs, reverifyName } from './lib/w3/name-resolver.js'
 import type { TxRef, NameResolution } from './lib/w3/name-resolver.js'
 import { fetchContractContent } from './lib/w3/erc5219.js'
 import type { ContractContent } from './lib/w3/erc5219.js'
@@ -667,14 +667,8 @@ async function twoPhaseResolve(
       const portalHeliosRpc = await portalHeliosPromise
       w3log('[w3] Mode 3 — ENS/GNS re-verification: helios rpc ready:', !!portalHeliosRpc, 'heliosBacked:', portalHeliosRpc?.isHeliosBacked())
       if (portalHeliosRpc?.isHeliosBacked() && parsed.target.type === 'ens') {
-        try {
-          const heliosResolution = await resolveEns(parsed.target.name, portalHeliosRpc)
-          ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-          w3log('[w3] Mode 3 — ENS/GNS re-verification result:', ensVerified)
-        } catch (e) {
-          console.warn('[w3] Mode 3 — ENS/GNS re-verification error:', (e as Error).message)
-          ensVerified = undefined
-        }
+        ensVerified = await reverifyName(parsed.target.name, portalHeliosRpc, phase1EnsChunks)
+        w3log('[w3] Mode 3 — ENS/GNS re-verification result:', ensVerified)
       }
 
       const update: VerificationUpdate = {
@@ -831,13 +825,8 @@ async function twoPhaseResolve(
       // heliosPromise is already settled — verifyViaBeacon awaited it internally
       const historicalHeliosRpc = await heliosPromise
       if (historicalHeliosRpc?.isHeliosBacked() && parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
-        try {
-          const heliosResolution = await resolveEns(parsed.target.name, historicalHeliosRpc)
-          ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-          w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
-        } catch {
-          ensVerified = undefined
-        }
+        ensVerified = await reverifyName(parsed.target.name, historicalHeliosRpc, phase1EnsChunks)
+        w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
       }
       update = {
         type: 'verification-update',
@@ -918,13 +907,8 @@ async function twoPhaseResolve(
     w3log(`[w3] Mode 1 — render binding: ${phase1Results.length} chunk(s) verified, rendered bytes match Helios ✓`)
 
     if (parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
-      try {
-        const heliosResolution = await resolveEns(parsed.target.name, heliosRpc)
-        ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-        w3log('[w3] Mode 1 — ENS/GNS re-verification result:', ensVerified)
-      } catch {
-        ensVerified = undefined
-      }
+      ensVerified = await reverifyName(parsed.target.name, heliosRpc, phase1EnsChunks)
+      w3log('[w3] Mode 1 — ENS/GNS re-verification result:', ensVerified)
     }
 
     update = {
@@ -983,13 +967,8 @@ async function twoPhaseResolve(
         }
         // heliosRpc synced but threw EIP-2935 on block lookup; ENS uses 'latest' so it works
         if (heliosRpc?.isHeliosBacked() && parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
-          try {
-            const heliosResolution = await resolveEns(parsed.target.name, heliosRpc)
-            ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-            w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
-          } catch {
-            ensVerified = undefined
-          }
+          ensVerified = await reverifyName(parsed.target.name, heliosRpc, phase1EnsChunks)
+          w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
         }
         update = {
           type: 'verification-update',

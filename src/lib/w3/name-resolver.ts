@@ -55,7 +55,8 @@ function encodeUint256(n: number): Uint8Array {
 }
 
 async function ethCall(rpc: IVerifiedRpc, to: string, data: BytesLike): Promise<string> {
-  return rpc.request<string>('eth_call', [{ to, data: hexlify(data) }, 'finalized'])
+  // Query at Helios's verified head ('latest'). 
+  return rpc.request<string>('eth_call', [{ to, data: hexlify(data) }, 'latest'])
 }
 
 // resolver(bytes32 node) → address
@@ -173,7 +174,7 @@ function parseContentContract(raw: string): ContractResolution | null {
 // ---------------------------------------------------------------------------
 
 // ENS/WNS/GNS re-verification: after phase 1 resolves a name via a plain RPC, the name is
-// re-resolved through Helios (trustless, at `finalized`) and the two chunk lists compared.
+// re-resolved through Helios (trustless, at its verified head) and the two chunk lists compared.
 // Returns true if Helios confirms the same chunks, false if it resolves to definitively
 // different non-empty chunks (possible forgery), undefined if Helios couldn't resolve
 // (error or empty result — unverified, not proof of forgery).
@@ -184,6 +185,29 @@ export function compareEnsChunks(heliosChunks: TxRef[], phase1Chunks: TxRef[]): 
       const p = phase1Chunks[i]
       return c.blockNumber === p.blockNumber && c.txIndex === p.txIndex
     })
+}
+
+// Re-resolve a name through Helios and compare it to the phase-1 chunks, retrying on a
+// transient failure. 
+export async function reverifyName(
+  name: string,
+  rpc: IVerifiedRpc,
+  phase1Chunks: TxRef[],
+  attempts = 4,
+  delayMs = 1500,
+): Promise<boolean | undefined> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const { chunks } = await resolveEns(name, rpc)
+      const result = compareEnsChunks(chunks, phase1Chunks)
+      if (result !== undefined) return result   // Helios resolved definitively (match / mismatch)
+    } catch (e) {
+      if (i === attempts - 1) console.warn(`[w3] name re-verification for "${name}" gave up after ${attempts} tries:`, (e as Error).message ?? e)
+      // else: transient cold-Helios failure — fall through and retry
+    }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs))
+  }
+  return undefined
 }
 
 function serviceName(name: string): string {
@@ -226,7 +250,7 @@ export async function resolveEns(
     console.warn(`[w3] getText failed for "${name}":`, (e as Error).message ?? e)
     return null
   })
-  if (!raw) throw new Error(`${service} "${name}" has no "w3" text record at the finalized block.`)
+  if (!raw) throw new Error(`${service} "${name}" has no "w3" text record in Helios's verified state.`)
 
   return { chunks: parseW3Record(service, raw) }
 }
@@ -263,5 +287,5 @@ export async function resolveName(
   const addr = await getAddr(rpc, resolver, node)
   if (addr) return { kind: 'contract', address: addr }
 
-  throw new Error(`${service} "${name}" has no "w3", "contentcontract", or address record at the finalized block.`)
+  throw new Error(`${service} "${name}" has no "w3", "contentcontract", or address record in Helios's verified state.`)
 }
