@@ -781,7 +781,7 @@ function applyVerification(msg: VerificationUpdate) {
   let isEnsTarget = false
   try { isEnsTarget = parseWeb3URL(msg.proof.url).target.type === 'ens' } catch {}
 
-  const ensTag = isEnsTarget ? ' · ENS ✓' : ''
+  const ensTag = isEnsTarget ? ' · Name ✓' : ''
   const verified = (cls: string, label: string, delay = 2000) => {
     verifyBadge.className = cls
     verifyIcon.textContent = '✓'
@@ -801,10 +801,10 @@ function applyVerification(msg: VerificationUpdate) {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
     verifyLabel.textContent = msg.ensVerified === false
-      ? 'ENS forged — record differs from Helios'
-      : 'Unverified — ENS not confirmed by Helios'
+      ? 'Name forged — record differs from Helios'
+      : 'Unverified — Name not confirmed by Helios'
     if (msg.ensVerified === false) {
-      warningText.textContent = 'ENS record mismatch — the RPC returned a different record than Helios confirmed. This may indicate a compromised RPC endpoint.'
+      warningText.textContent = 'Name record mismatch — the RPC returned a different record than Helios confirmed. This may indicate a compromised RPC endpoint.'
       showWarning()
     }
     return
