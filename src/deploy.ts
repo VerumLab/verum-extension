@@ -12,6 +12,7 @@ import {
   toHex, txGasLimit, W3FS_DEPOSIT, type DeployFile,
 } from './lib/w3/encoder.js'
 import { DEFAULT_CHAINS, type BgResponse, type ChainConfig } from './types.js'
+import { ensureWalletChain, CHAIN_BOUND_METHODS } from './lib/wallets/chain-guard.js'
 
 // ---------------------------------------------------------------------------
 // Elements
@@ -243,20 +244,12 @@ async function encodeSelection(maxCalldata?: number) {
 const SIZE_ERR = /too large|payload|413|entity too large|request body|max.*(size|length)|exceed/i
 
 // Detect the connected wallet RPC's request-size limit: the largest calldata it will accept
-// in one transaction. We probe with eth_estimateGas — it is tx-shaped and hits the SAME
-// request-body limit as the eth_sendRawTransaction broadcast (eth_call is handled differently
-// and RPCs allow it far larger, so it over-estimates), yet needs no approval and no gas. We
+// in one transaction. We probe with eth_estimateGas, needs no approval and no gas. We
 // binary-search the largest size that isn't rejected. A "request too large" / 413 / payload
 // error means the body exceeded the cap; any other outcome (incl. a normal gas estimate)
-// means the size was fine. This packs as few txs as the RPC allows. The probe is a proxy, so
-// the send loop still shrinks and retries if a real tx is rejected (see sendTransactions).
+// means the size was fine. This packs as few txs as the RPC allows. 
 const PROBE_FLOOR = 56_000
 const PROBE_CEIL = 200_000
-// Real deploys show the probe over-estimates: a ~67 KB chunk broadcasts fine through MetaMask's RPC, while
-// ~105 KB and larger are rejected ("Request too large") even though the eth_estimateGas test accepted
-// 200 KB — the estimate path is more lenient than the broadcast path. Each rejected broadcast can also cost
-// the user a wallet approval. So the probe result is clamped to a size known to broadcast, and only a chunk
-// size that has actually confirmed for this chain + wallet (loadKnownCap) may start higher.
 const PROBE_SAFE_CEIL = 72_000
 
 const knownCapKey = () => `deployCap_${chain?.chainId ?? 0}_${selectedWalletId ?? 'wallet'}`
@@ -366,8 +359,12 @@ const previewReady = new Promise<void>((resolve) =>
 function sendToPreview(html: string, assetMap: Record<string, string> = {}) {
   previewRaw.classList.add('hidden')
   previewFrame.classList.remove('hidden')
+  // Hand the sandbox the OS color scheme, as the viewer does (renderer.ts). The sandbox overrides
+  // matchMedia('(prefers-color-scheme: …)') with this flag; without it the preview always reports
+  // light, so a page that follows the OS preference showed white in the preview but dark when opened.
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
   previewReady.then(() =>
-    previewFrame.contentWindow?.postMessage({ type: 'render', html, assetMap, chainId: chain?.chainId ?? 1 }, '*'),
+    previewFrame.contentWindow?.postMessage({ type: 'render', html, assetMap, chainId: chain?.chainId ?? 1, prefersDark }, '*'),
   )
 }
 function showRawPreview(build: (host: HTMLElement) => void) {
@@ -488,8 +485,13 @@ window.addEventListener('message', async (e) => {
   if (!e.data || e.source !== previewFrame.contentWindow) return
   if (e.data.type !== 'eth-request') return
   const { id, method, params } = e.data
-  const reply = (result?: unknown, error?: string) =>
+  // Reply once: a failed chain check answers the request itself, and the caller then returns.
+  let replied = false
+  const reply = (result?: unknown, error?: string) => {
+    if (replied) return
+    replied = true
     previewFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error }, '*')
+  }
 
   // Answerable without a wallet — the URL's chain is authoritative.
   if (method === 'eth_chainId') { reply('0x' + (chain?.chainId ?? 1).toString(16)); return }
@@ -502,10 +504,10 @@ window.addEventListener('message', async (e) => {
   }
 
   if (CONNECT_METHODS.has(method)) {
-    if (!account) {
-      const connected = await ensureWallet(msg => reply(undefined, msg))
-      if (!connected) { reply(undefined, 'User rejected wallet selection'); return }
-    }
+    // Always through ensureWallet: it connects when needed AND verifies the wallet's chain, including when
+    // an account is already connected (the wallet may since have been left on another network).
+    const connected = await ensureWallet(msg => reply(undefined, msg))
+    if (!connected) { reply(undefined, 'User rejected wallet selection'); return }
     const resp = await walletRpc(method, params ?? [])
     if (!resp.error && Array.isArray(resp.result)) notifyPreviewAccounts(resp.result)
     reply(resp.result, resp.error)
@@ -514,6 +516,9 @@ window.addEventListener('message', async (e) => {
 
   if (WALLET_METHODS.has(method) || method.startsWith('wallet_')) {
     if (!account) { reply(undefined, 'Not connected'); return }
+    // The page believes it is on the preview's chain (eth_chainId above is answered from the selector), but the
+    // wallet decides its own network per site. Make sure a send goes out on the chain being previewed.
+    if (CHAIN_BOUND_METHODS.has(method) && !(await ensureChain(msg => reply(undefined, msg)))) return
     const resp = await walletRpc(method, params ?? [])
     reply(resp.result, resp.error)
     return
@@ -763,15 +768,10 @@ async function ensureWallet(onError: (msg: string) => void): Promise<string | nu
 
 async function ensureChain(onError: (msg: string) => void): Promise<boolean> {
   if (!chain) { onError('No chain configured'); return false }
-  const want = '0x' + chain.chainId.toString(16)
-  const cur = await walletRpc('eth_chainId', [])
-  if (typeof cur.result === 'string' && cur.result.toLowerCase() === want) return true
-  const sw = await walletRpc('wallet_switchEthereumChain', [{ chainId: want }])
-  if (sw.error) {
-    onError(`Wallet is on the wrong network and switching failed: ${sw.error}. ` +
-      `Switch to ${chain.name} (chainId ${chain.chainId}) in the wallet, then retry.`)
-    return false
-  }
+  // Asks the WALLET which chain it will use for this site (MetaMask picks per site, so it can differ from
+  // the network shown in its UI) and switches it if needed — see lib/wallets/chain-guard.ts.
+  const err = await ensureWalletChain(walletRpc, chain.chainId, chain.name)
+  if (err) { onError(err); return false }
   return true
 }
 

@@ -2,6 +2,7 @@ import { formatWeb3URL, parseWeb3URL } from './lib/w3/url-parser.js'
 import { parseBundle, bundleFileAt } from './lib/w3/content.js'
 import { buildWebsiteHtml } from './lib/w3/website-html.js'
 import { startRocketGame, stopRocketGame } from './rocket-game.js'
+import { ensureWalletChain, CHAIN_BOUND_METHODS } from './lib/wallets/chain-guard.js'
 import { AGREEMENT_VERSION } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate } from './types.js'
 
@@ -344,6 +345,17 @@ const FRAME_APPROVAL_METHODS = new Set([
   'wallet_switchEthereumChain', 'wallet_addEthereumChain',
 ])
 
+// One request to the selected wallet over a port (keeps the service worker alive while a wallet popup is
+// open — same pattern as the main request path below).
+function walletCall(method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
+  return new Promise((resolve) => {
+    const port = chrome.runtime.connect({ name: 'eth-request' })
+    port.postMessage({ method, params, walletId: selectedWalletId })
+    port.onMessage.addListener((msg) => { port.disconnect(); resolve(msg) })
+    port.onDisconnect.addListener(() => resolve({ error: 'Wallet disconnected' }))
+  })
+}
+
 window.addEventListener('message', async (e) => {
   if (!e.data) return
   if (e.source !== websiteFrame.contentWindow) return
@@ -499,6 +511,15 @@ window.addEventListener('message', async (e) => {
     }
     selectedWalletId = picked
     selectedWalletName = wallets.find(w => w.id === picked)?.name ?? 'wallet'
+  }
+
+  // Funds-spending calls must go out on the chain this page is showing. eth_chainId is answered from the
+  // URL (above), so the website always believes it is on the right network — but the wallet picks its
+  // network per site, and can be on another one. Ask the wallet and switch it (with the user's approval)
+  // BEFORE the transaction reaches it, instead of silently sending on the wrong chain.
+  if (CHAIN_BOUND_METHODS.has(method) && selectedWalletId) {
+    const chainErr = await ensureWalletChain(walletCall, currentChainId)
+    if (chainErr) { sendBack(undefined, chainErr); return }
   }
 
   const needsApprovalToast =
