@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Verum",
   "short_name": "verum",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Browse websites and data stored on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",

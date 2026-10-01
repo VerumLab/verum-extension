@@ -15,14 +15,22 @@ import { W3FS_MAGIC } from '../../types.js'
 // 0x…57334653 ("W3FS" magic bytes padded to 20 bytes).
 export const W3FS_DEPOSIT = '0x0000000000000000000000000000000057334653'
 
-// Max calldata bytes per tx. Public RPCs (publicnode, drpc, …) cap raw tx
-// size at 128 KB — 125 000 payload bytes keeps the full tx under that.
-export const MAX_CALLDATA = 125_000
+// Default max calldata bytes per tx, used only for the pre-deploy size estimate. The real
+// deploy re-encodes with the wallet RPC's probed request-size limit (deploy.ts
+// probeMaxCalldata), so this is just a starting figure. Note the chunk is broadcast
+// HEX-encoded (2 chars/byte), so the JSON-RPC request body is ~2× this.
+export const MAX_CALLDATA = 72_000
 
-// Raw slice size for oversized single files: gzip of an incompressible
-// 110 000-byte slice stays well under MAX_CALLDATA (stored-block overhead
-// is ~5 bytes per 64 KB plus an 18-byte gzip header).
-const RAW_SLICE = 110_000
+// Reserved and subtracted from the per-tx cap to cover the W3FS chunk header plus gzip
+// stored-block overhead (~5 bytes / 32 KB + an 18-byte header), so the final calldata stays
+// within the cap even for incompressible input (PDFs, images) that gzip can't shrink.
+const CHUNK_RESERVE = 1024
+
+// encodeSingleFile packing: a raw slice this much smaller than the cap always gzips to within it
+// (incompressible data expands by ~5 bytes per 16 KB plus a header), and the search for the largest
+// slice that fits stops once the bracket is this narrow (bytes).
+const GZIP_SLACK = 512
+const BISECT_STEP = 256
 
 const VERSION = 0x01
 const COMPRESSION: Record<string, number> = { none: 0, gzip: 1, deflate: 2, brotli: 3 }
@@ -110,31 +118,61 @@ export function buildBundleBinary(files: DeployFile[]): Uint8Array {
   return out
 }
 
-// Single file → one or more calldata chunks.
-export async function encodeSingleFile(mime: string, data: Uint8Array): Promise<Uint8Array[]> {
+// Single file → one or more calldata chunks. maxCalldata is the per-tx calldata ceiling
+// (probed from the wallet RPC at deploy time); each produced chunk stays within it.
+export async function encodeSingleFile(mime: string, data: Uint8Array, maxCalldata = MAX_CALLDATA): Promise<Uint8Array[]> {
+  const cap = Math.max(4096, maxCalldata - CHUNK_RESERVE)
   const compressed = await gzipBytes(data)
-  if (compressed.length <= MAX_CALLDATA) {
+  if (compressed.length <= cap) {
     return [buildW3fsChunk(mime, 'gzip', 0, 1, compressed)]
   }
-  // Oversized: split the RAW bytes and gzip each slice independently — the
-  // assembler decompresses each chunk then concatenates.
-  const total = Math.ceil(data.length / RAW_SLICE)
-  const chunks: Uint8Array[] = []
-  for (let i = 0; i < total; i++) {
-    const gz = await gzipBytes(data.slice(i * RAW_SLICE, (i + 1) * RAW_SLICE))
-    chunks.push(buildW3fsChunk(mime, 'gzip', i, total, gz))
+  // Oversized: split into chunks that are each gzipped independently (the assembler decompresses
+  // every chunk, then concatenates). Pack by COMPRESSED size: for each chunk take the largest raw
+  // slice whose own gzip still fits in `cap`. Slicing the raw bytes at `cap` instead (the old way)
+  // left compressible files — HTML, JS, JSON — at 25–40% of the cap per transaction, so a 178 KB
+  // result took 5 transactions where 3 suffice. Incompressible data (PDFs, images) comes out the
+  // same as a raw cap-sized slice.
+  const gzSlices: Uint8Array[] = []
+  let pos = 0
+  while (pos < data.length) {
+    const remaining = data.length - pos
+    const gzOf = (len: number) => gzipBytes(data.subarray(pos, pos + len))
+    // `lo` fits: even incompressible input only grows by ~5 bytes per 16 KB plus a small header.
+    let lo = Math.min(remaining, Math.max(1, cap - GZIP_SLACK))
+    let best = await gzOf(lo)
+    while (best.length > cap && lo > 1) { lo = Math.max(1, Math.floor(lo * 0.9)); best = await gzOf(lo) }
+    if (lo < remaining) {
+      // Grow geometrically until a slice no longer fits (or the rest of the file does)…
+      let hi = lo
+      while (hi < remaining) {
+        const next = Math.min(remaining, hi * 2)
+        const g = await gzOf(next)
+        hi = next
+        if (g.length <= cap) { lo = next; best = g } else break
+      }
+      // …then bisect between the last size that fit and the first that didn't. Gzip size is not
+      // strictly monotonic, but `best` is only ever replaced by a slice that fit, so it always does.
+      while (hi - lo > BISECT_STEP) {
+        const mid = lo + ((hi - lo) >> 1)
+        const g = await gzOf(mid)
+        if (g.length <= cap) { lo = mid; best = g } else hi = mid
+      }
+    }
+    gzSlices.push(best)
+    pos += lo
   }
-  return chunks
+  return gzSlices.map((gz, i) => buildW3fsChunk(mime, 'gzip', i, gzSlices.length, gz))
 }
 
-// Directory → bundle binary, gzipped once, split into 'none' slices.
-export async function encodeBundle(files: DeployFile[]): Promise<{ chunks: Uint8Array[]; rawSize: number; compressedSize: number }> {
+// Directory → bundle binary, gzipped once, split into 'none' slices within maxCalldata.
+export async function encodeBundle(files: DeployFile[], maxCalldata = MAX_CALLDATA): Promise<{ chunks: Uint8Array[]; rawSize: number; compressedSize: number }> {
+  const cap = Math.max(4096, maxCalldata - CHUNK_RESERVE)
   const bundle = buildBundleBinary(files)
   const compressed = await gzipBytes(bundle)
-  const total = Math.ceil(compressed.length / MAX_CALLDATA)
+  const total = Math.ceil(compressed.length / cap)
   const chunks: Uint8Array[] = []
   for (let i = 0; i < total; i++) {
-    const slice = compressed.slice(i * MAX_CALLDATA, (i + 1) * MAX_CALLDATA)
+    const slice = compressed.slice(i * cap, (i + 1) * cap)
     chunks.push(buildW3fsChunk(BUNDLE_MIME, 'none', i, total, slice))
   }
   return { chunks, rawSize: bundle.length, compressedSize: compressed.length }

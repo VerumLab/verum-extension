@@ -98,6 +98,18 @@ return '<scr' + 'ipt>(function(){' +
     '})}' +
   'try{Object.defineProperty(window,"localStorage",{value:MS("l"),configurable:true});}catch(e){}' +
   'try{Object.defineProperty(window,"sessionStorage",{value:MS("s"),configurable:true});}catch(e){}' +
+  // history.replaceState/pushState shim. In this opaque-origin srcdoc frame (origin "null", URL
+  // about:srcdoc) a relative URL resolves against the PARENT frame (chrome-extension://…), so any
+  // "#hash", "/path" or "?query" URL throws SecurityError. That breaks apps that keep the hash in
+  // sync (e.g. history.replaceState(null,"","#"+name)) and made the share-link restore below fail
+  // silently. Only "about:srcdoc#…" is accepted here, so rewrite the URL to its fragment on that
+  // base; a URL with no fragment can't be represented in a srcdoc, so leave the URL unchanged
+  // rather than throw. The state object is passed through untouched.
+  'try{var _H=window.history;["replaceState","pushState"].forEach(function(k){var o=_H[k];' +
+    'if(typeof o!=="function")return;' +
+    '_H[k]=function(s,t,u){' +
+      'if(u!=null){u=String(u);var i=u.indexOf("#");u=i>=0?"about:srcdoc"+u.slice(i):undefined;}' +
+      'return o.call(_H,s,t,u);};});}catch(e){}' +
   // Restore share-link state: the website reads location.hash on load, but about:srcdoc has
   // an empty hash. Set it (from the w3:// URL fragment) before the website's scripts run so it
   // rehydrates (#token=ETH&out=wstETH). Same-document, fires hashchange — harmless.
@@ -197,6 +209,13 @@ return '<scr' + 'ipt>(function(){' +
         'var method=(init&&init.method)||(input&&typeof input!=="string"&&input.method)||"GET";' +
         'if(String(method).toUpperCase()==="POST"){' +
           'var body=(init&&init.body!=null)?init.body:null;' +
+          // ethers (and other libraries that build requests as bytes) send the JSON as a
+          // Uint8Array/ArrayBuffer rather than a string. Decode it so the same JSON-RPC check
+          // below applies — nothing new is proxied, a bytes body that isn't JSON-RPC still
+          // falls through to native fetch untouched.
+          'if(body&&typeof body!=="string"&&(body instanceof ArrayBuffer||ArrayBuffer.isView(body))){' +
+            'try{body=new TextDecoder().decode(body);}catch(e){}' +
+          '}' +
           'if(typeof body==="string"){' +
             'var j=null;try{j=JSON.parse(body);}catch(e){}' +
             'var one=_isRpc(j);' +

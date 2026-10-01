@@ -25,17 +25,11 @@ dist/
 
 # Local test dapps
 scripts/dapp_multi_file/
-scripts/test-bundle/
-
-# Strawmap: the builder and everything it exports from the Google Drawing
-scripts/build-strawmap.js
-scripts/strawmap/
-scripts/.strawmap-tmp/
 
 # Logs
 *.log
 npm-debug.log*
 test/.verification-flow-proof.mjs
 
-# Example pages
+# Examples: sample pages, test bundles, and the builders with their output
 examples/

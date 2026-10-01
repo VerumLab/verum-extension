@@ -226,17 +226,86 @@ async function selectEntries(files: DeployFile[], label: string, dir: boolean) {
 let rawSize = 0
 let onchainSize = 0
 
-async function encodeSelection() {
+async function encodeSelection(maxCalldata?: number) {
   if (isDirectory) {
-    const res = await encodeBundle(entries)
+    const res = await encodeBundle(entries, maxCalldata)
     calldatas = res.chunks
     rawSize = res.rawSize
   } else {
     const e = entries[0]
-    calldatas = await encodeSingleFile(e.mime, e.data)
+    calldatas = await encodeSingleFile(e.mime, e.data, maxCalldata)
     rawSize = e.data.length
   }
   onchainSize = calldatas.reduce((n, c) => n + c.length, 0)
+}
+
+// Matches the RPC/wallet "request body too large" family of errors (exact wording varies).
+const SIZE_ERR = /too large|payload|413|entity too large|request body|max.*(size|length)|exceed/i
+
+// Detect the connected wallet RPC's request-size limit: the largest calldata it will accept
+// in one transaction. We probe with eth_estimateGas — it is tx-shaped and hits the SAME
+// request-body limit as the eth_sendRawTransaction broadcast (eth_call is handled differently
+// and RPCs allow it far larger, so it over-estimates), yet needs no approval and no gas. We
+// binary-search the largest size that isn't rejected. A "request too large" / 413 / payload
+// error means the body exceeded the cap; any other outcome (incl. a normal gas estimate)
+// means the size was fine. This packs as few txs as the RPC allows. The probe is a proxy, so
+// the send loop still shrinks and retries if a real tx is rejected (see sendTransactions).
+const PROBE_FLOOR = 56_000
+const PROBE_CEIL = 200_000
+// Real deploys show the probe over-estimates: a ~67 KB chunk broadcasts fine through MetaMask's RPC, while
+// ~105 KB and larger are rejected ("Request too large") even though the eth_estimateGas test accepted
+// 200 KB — the estimate path is more lenient than the broadcast path. Each rejected broadcast can also cost
+// the user a wallet approval. So the probe result is clamped to a size known to broadcast, and only a chunk
+// size that has actually confirmed for this chain + wallet (loadKnownCap) may start higher.
+const PROBE_SAFE_CEIL = 72_000
+
+const knownCapKey = () => `deployCap_${chain?.chainId ?? 0}_${selectedWalletId ?? 'wallet'}`
+let capIsKnownGood = false
+async function loadKnownCap(): Promise<number | null> {
+  try {
+    const k = knownCapKey()
+    const v = (await chrome.storage.local.get(k))[k]
+    return typeof v === 'number' && v >= PROBE_FLOOR && v <= PROBE_CEIL ? v : null
+  } catch { return null }
+}
+async function saveKnownCap(len: number) {
+  try {
+    const k = knownCapKey()
+    const prev = (await chrome.storage.local.get(k))[k]
+    if (typeof prev !== 'number' || len > prev) await chrome.storage.local.set({ [k]: Math.min(len, PROBE_CEIL) })
+  } catch { /* best effort */ }
+}
+async function forgetKnownCap() {
+  try { await chrome.storage.local.remove(knownCapKey()) } catch { /* best effort */ }
+}
+// Where a fresh deploy starts: the largest chunk that already confirmed for this chain + wallet, else the
+// probe result clamped to the proven-safe ceiling.
+async function initialCap(): Promise<number> {
+  const known = await loadKnownCap()
+  capIsKnownGood = known !== null
+  return known ?? Math.min(await probeMaxCalldata(), PROBE_SAFE_CEIL)
+}
+async function probeMaxCalldata(): Promise<number> {
+  const RATE_ERR = /rate|429|too many|timeout|temporarily|unavailable|forbidden/i
+  const accepts = async (bytes: number): Promise<boolean | null> => {
+    const data = '0x' + 'ab'.repeat(bytes)          // `bytes` bytes of calldata
+    const r = await walletRpc('eth_estimateGas', [{ to: W3FS_DEPOSIT, data }])
+    if (r.error && RATE_ERR.test(r.error)) return null        // rate-limited / transient — unknown
+    return !(r.error && SIZE_ERR.test(r.error))               // false only on a size rejection
+  }
+  try {
+    // Test a few descending tiers and take the largest accepted, returning on the FIRST accept
+    // — a lenient RPC costs one request, a strict one only a handful, and there's no tight
+    // loop that could trip rate limits. Any transient/unknown error → the safe floor.
+    for (const bytes of [PROBE_CEIL, 140_000, 100_000, 72_000, PROBE_FLOOR]) {
+      const ok = await accepts(bytes)
+      if (ok === null) return PROBE_FLOOR
+      if (ok) return bytes - 4_000                             // margin for tx RLP + W3FS header
+    }
+    return PROBE_FLOOR
+  } catch {
+    return PROBE_FLOOR                                          // probe failed — safe fallback
+  }
 }
 
 function renderSummary() {
@@ -256,13 +325,35 @@ async function estimateCost() {
   costEl.textContent = '…'
   if (!chain) { costEl.textContent = '—'; return }
   const totalGas = calldatas.reduce((n, c) => n + txGasLimit(c), 0n)
+  const rpc = (method: string, params: unknown[]) =>
+    chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: chain!.chainId, method, params }) as Promise<{ result?: any; error?: string }>
   try {
-    const resp = await chrome.runtime.sendMessage({
-      type: 'eth-rpc', chainId: chain.chainId, method: 'eth_gasPrice', params: [],
-    }) as { result?: string; error?: string }
-    if (!resp?.result) throw new Error(resp?.error ?? 'no gas price')
-    const wei = totalGas * BigInt(resp.result)
-    costEl.textContent = `~${(Number(wei) / 1e18).toFixed(5)} ETH (${totalGas.toLocaleString()} gas)`
+    // Match what the wallet actually charges (EIP-1559): base fee (from the latest block) plus a
+    // priority tip. eth_gasPrice alone returns roughly the base fee and badly under-counts on
+    // low-base-fee networks where the tip dominates (e.g. 0.17 gwei base vs a ~2 gwei tip).
+    const [block, tip] = await Promise.all([
+      rpc('eth_getBlockByNumber', ['latest', false]),
+      rpc('eth_maxPriorityFeePerGas', []),
+    ])
+    const baseFee = BigInt(block?.result?.baseFeePerGas ?? '0')
+    // Show a slow–fast range, since the fee is the wallet's choice and a data-only deploy has no
+    // urgency (slow is the sensible pick). Tips scale with the network's suggested tip; on quiet
+    // chains that reports ~0, so slow ≈ base fee + a token tip and fast is floored at ~3 gwei.
+    const rpcTip = tip?.result ? BigInt(tip.result) : 0n
+    const slowTip = rpcTip > 0n ? rpcTip / 2n : baseFee / 20n            // half the suggested tip, or ~5% of base
+    const fastTip = rpcTip * 2n > 3_000_000_000n ? rpcTip * 2n : 3_000_000_000n   // ≥3 gwei
+    let slowFee = baseFee > 0n ? baseFee + slowTip : 0n
+    let fastFee = baseFee > 0n ? baseFee + fastTip : 0n
+    if (fastFee === 0n) {                                                // pre-1559 chain — single price
+      const gp = await rpc('eth_gasPrice', [])
+      const g = gp?.result ? BigInt(gp.result) : 0n
+      slowFee = g; fastFee = g
+    }
+    if (fastFee === 0n) throw new Error('no fee data')
+    const fmtEth = (w: bigint) => (Number(w) / 1e18).toFixed(5)
+    costEl.textContent = slowFee === fastFee || slowFee === 0n
+      ? `~${fmtEth(totalGas * fastFee)} ETH (${totalGas.toLocaleString()} gas)`
+      : `~${fmtEth(totalGas * slowFee)}–${fmtEth(totalGas * fastFee)} ETH (${totalGas.toLocaleString()} gas · slow–fast)`
   } catch {
     costEl.textContent = `${totalGas.toLocaleString()} gas (gas price unavailable)`
   }
@@ -718,8 +809,25 @@ function setTxStatus(i: number, text: string, cls?: 'ok' | 'fail') {
   ;(li.querySelector('.tx-status') as HTMLElement).textContent = text
 }
 
-async function sendTransactions() {
+async function sendTransactions(cap?: number) {
   lockChainSelector()
+
+  // Fresh deploy: probe the wallet RPC's request-size limit and re-chunk to pack as few txs
+  // as it allows (probe + any oversize rejection cost no gas). On a retry (nextTxIndex > 0) we
+  // keep the existing chunking so already-sent chunks still line up with their coordinates.
+  // `cap` is passed only when the send loop shrinks and retries below — then we skip the probe.
+  if (nextTxIndex === 0) {
+    if (cap === undefined) {
+      const probing = document.createElement('li')
+      probing.textContent = 'Detecting wallet RPC limit…'
+      txList.appendChild(probing)
+      cap = await initialCap()
+    }
+    await encodeSelection(cap)
+    renderSummary()          // the probe may re-chunk (e.g. 2 → 3 txs): sync the summary + cost
+    txList.innerHTML = ''
+  }
+
   for (let i = 0; i < calldatas.length; i++) txListItem(i)
 
   for (; nextTxIndex < calldatas.length; nextTxIndex++) {
@@ -741,6 +849,20 @@ async function sendTransactions() {
     setTxStatus(i, 'approve in wallet…')
     const sent = await walletRpc('eth_sendTransaction', [{ from, to: W3FS_DEPOSIT, data, gas }])
     if (sent.error || typeof sent.result !== 'string') {
+      // Safety net: the real tx hit a size limit the probe under-shot. Nothing has been
+      // broadcast yet (i === 0 → no gas spent), so shrink the cap, re-chunk, and retry from the
+      // top. `cap` is only set on a fresh deploy, so this never fires mid-deploy after a chunk lands.
+      if (i === 0 && cap !== undefined && cap > PROBE_FLOOR && sent.error && SIZE_ERR.test(sent.error)) {
+        // Shrink from the size that actually failed, and only if that yields smaller chunks — a small
+        // file that already fits in one chunk would just be resent (and re-approved) unchanged.
+        const failedLen = calldatas[0].length
+        const smaller = Math.max(PROBE_FLOOR, Math.floor(Math.min(failedLen, cap) * 0.7))
+        if (smaller < failedLen) {
+          if (capIsKnownGood) { capIsKnownGood = false; await forgetKnownCap() }   // stale (different RPC/wallet now)
+          setTxStatus(i, 're-splitting into smaller chunks…', 'fail')
+          return sendTransactions(smaller)
+        }
+      }
       setTxStatus(i, 'failed', 'fail')
       showDeployError(sent.error ?? 'eth_sendTransaction returned no hash')
       retryDeploy.classList.remove('hidden')
@@ -766,6 +888,9 @@ async function sendTransactions() {
     const txIndex = parseInt(receipt.transactionIndex, 16)
     coords.push({ blockNumber, txIndex })
     setTxStatus(i, `✓ block ${blockNumber}, index ${txIndex}`, 'ok')
+    // A chunk near the cap confirmed, so that size is known to broadcast through this wallet's RPC:
+    // remember it, so the next deploy starts there instead of guessing (a small file proves nothing).
+    if (cap !== undefined && calldatas[i].length >= cap * 0.9) void saveKnownCap(calldatas[i].length)
   }
 
   stepDeploy.classList.add('done')
