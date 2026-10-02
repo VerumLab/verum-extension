@@ -87,7 +87,6 @@ for (let i = 0; i < lines.length; i++) {
 }
 
 const ensValue = JSON.stringify(coords)
-const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
 
 console.error('\n─────────────────────────────────────────')
 console.error('Name record value (copy to set-name.js):')

@@ -6,13 +6,13 @@ import type { Web3URL } from '../../types.js'
 //   w3://myapp.gwei                      GNS name
 //   w3://myapp.wei                       WNS name (contract-served)
 //   w3://myapp.eth:<chainId>             Name on a specific chain (ERC-4804 trailing form)
+//   w3://0x<address>[:<chainId>]         Contract address (ERC-5219 / ERC-8244)
 //   w3://<blockNumber>:<txIndex>         Direct tx reference (uses default chain)
-//   w3://<chainId>:<blockNumber>:<txIndex>  Tx reference on specific chain (verum leading form)
+//   w3://<blockNumber>:<txIndex>:<chainId>  Tx reference on a specific chain
 //   ...with optional /path suffix
 //
-// Chain id placement differs by target: a NAME (an ERC-4804 host) carries an optional
-// trailing ":<chainId>" suffix, matching ERC-4804/ERC-6860; a tx reference (verum-
-// specific, not an ERC-4804 host) carries an optional leading "<chainId>:" prefix.
+// Every form carries its chain id the same way: an optional trailing ":<chainId>" (ERC-4804 /
+// ERC-6860 style for names and addresses, and the same for a tx reference).
 
 export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
   const stripped = raw.replace(/^w3:\/\//i, '')
@@ -67,25 +67,12 @@ export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
     return { raw, chainId, target: { type: 'ens', name }, path }
   }
 
-  // Direct tx reference(s): one or more blockNumber:txIndex pairs separated by +,
-  // with an optional leading "<chainId>:" prefix.
-  const firstColon = rest.indexOf(':')
-  if (firstColon !== -1) {
-    const maybeChain = rest.slice(0, firstColon)
-    const remainder = rest.slice(firstColon + 1)
-    if (/^\d+$/.test(maybeChain) && /^(\d+:\d+)(\+\d+:\d+)*$/.test(remainder)) {
-      // chainId:block:txIndex (or chainId:block:txIndex+block2:txIndex2)
-      chainId = parseInt(maybeChain, 10)
-      const refs = remainder.split('+').map(part => {
-        const [b, t] = part.split(':')
-        return { blockNumber: parseInt(b, 10), txIndex: parseInt(t, 10) }
-      })
-      return { raw, chainId, target: { type: 'tx', refs }, path }
-    }
-  }
-
-  if (/^(\d+:\d+)(\+\d+:\d+)*$/.test(rest)) {
-    const refs = rest.split('+').map(part => {
+  // Direct tx reference(s): one or more blockNumber:txIndex pairs separated by +, with an optional
+  // trailing ":<chainId>" (block:txIndex[+block:txIndex…][:chainId]).
+  const txMatch = rest.match(/^(\d+:\d+(?:\+\d+:\d+)*)(?::(\d+))?$/)
+  if (txMatch) {
+    if (txMatch[2]) chainId = parseInt(txMatch[2], 10)
+    const refs = txMatch[1].split('+').map(part => {
       const [b, t] = part.split(':')
       return { blockNumber: parseInt(b, 10), txIndex: parseInt(t, 10) }
     })
@@ -97,13 +84,12 @@ export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
 
 export function formatWeb3URL(parsed: Web3URL): string {
   const path = parsed.path === '/' ? '' : parsed.path
+  // Every target carries its chain id as a trailing ":<chainId>" (omitted on mainnet).
   if (parsed.target.type === 'tx') {
-    // verum tx form: leading "<chainId>:" prefix
-    const chain = parsed.chainId !== 1 ? `${parsed.chainId}:` : ''
+    const chain = parsed.chainId !== 1 ? `:${parsed.chainId}` : ''
     const refs = parsed.target.refs.map(r => `${r.blockNumber}:${r.txIndex}`).join('+')
-    return `w3://${chain}${refs}${path}`
+    return `w3://${refs}${chain}${path}`
   }
-  // ERC-4804 host form: trailing ":<chainId>" suffix
   const chain = parsed.chainId !== 1 ? `:${parsed.chainId}` : ''
   const host = parsed.target.type === 'contract' ? parsed.target.address : parsed.target.name
   return `w3://${host}${chain}${path}`

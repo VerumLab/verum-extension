@@ -9,13 +9,13 @@
 <body>
   <header>
     <h1>Deploy to Ethereum</h1>
-    <p>Publish a file or website as calldata on Ethereum.</p>
+    <p>Publish a file or website on Ethereum, as calldata or as contract code.</p>
        <div class="chain-selector-row">
       <select id="default-chain-select"></select>
       <span id="chain-locked" class="hidden">locked — deployment in progress</span>
     </div>
     <p class="header-aside">Already deployed?
-       <a href="#" id="link-existing">Link a name to existing coordinates</a></p>
+       <a href="#" id="link-existing">Link a name to an existing deployment</a></p>
   </header>
 
   <main>
@@ -39,6 +39,17 @@
     <section class="step hidden" id="step-preview">
       <div class="step-head"><span class="step-num">2</span><h2>Preview</h2></div>
       <div class="step-body">
+        <div id="storage-mode" role="radiogroup" aria-label="Storage">
+          <label class="storage-opt">
+            <input type="radio" name="storage" value="calldata" checked />
+            <span><strong>Calldata</strong> — cheapest · stored on archive nodes.</span>
+          </label>
+          <label class="storage-opt" id="storage-opt-contract">
+            <input type="radio" name="storage" value="contract" />
+            <span><strong>Contract code</strong> — expensive · stored on archive and full nodes.</span>
+          </label>
+        </div>
+
         <table id="summary">
           <tbody>
             <tr><td>Content</td><td id="sum-content">—</td></tr>
@@ -53,6 +64,7 @@
         <div id="preview-host">
           <iframe id="preview-frame" src="website-sandbox.html"></iframe>
           <div id="preview-raw" class="hidden"></div>
+          <div id="preview-chain-note" class="hidden"></div>
         </div>
         <p class="note">Rendered through the same sandbox as the real w3:// renderer — what you
           see here is what visitors will get after deployment.</p>
@@ -102,15 +114,16 @@
       <div class="step-head"><span class="step-num">5</span><h2>Link a name <span class="optional">optional</span></h2></div>
       <div class="step-body">
         <p>Point an ENS (<code>.eth</code>), GNS (<code>.gwei</code>), or WNS (<code>.wei</code>) name you own at this
-           deployment. This writes the <code>w3</code> text record with your wallet.</p>
+           deployment. This writes the <code>w3</code> text record (calldata) or the <code>contentcontract</code> record (contract code) with your wallet.</p>
 
-        <!-- Shown only when linking a name to an already-deployed set of coordinates -->
+        <!-- Shown only when linking a name to an already-deployed contract or set of coordinates -->
         <div id="coords-block" class="hidden">
-          <label for="coords-input">Deployment coordinates</label>
+          <label for="coords-input">Contract address or deployment coordinates</label>
           <input id="coords-input" type="text" spellcheck="false" autocomplete="off"
-                 placeholder="9012345:12  or  9012345:12+9012346:3  or  [[9012345,12]]" />
-          <p class="note">One <code>block:txIndex</code> pair per chunk, in order. Accepts the
-             <code>w3://</code> URL, the <code>+</code> form, or publish.js's JSON output.</p>
+                 placeholder="0x… contract  or  9012345:12  (block:txIndex)" />
+          <p class="note">A contract address (<code>0x…</code>, from a contract-code deployment), or one
+             <code>block:txIndex</code> pair per chunk, in order. Accepts the <code>w3://</code> URL, the
+             <code>+</code> form, or publish.js's JSON output.</p>
         </div>
 
         <p id="name-account-line" class="hidden">

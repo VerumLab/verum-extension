@@ -3,7 +3,8 @@ import { parseBundle, bundleFileAt } from './lib/w3/content.js'
 import { buildWebsiteHtml } from './lib/w3/website-html.js'
 import { startRocketGame, stopRocketGame } from './rocket-game.js'
 import { ensureWalletChain, CHAIN_BOUND_METHODS } from './lib/wallets/chain-guard.js'
-import { AGREEMENT_VERSION } from './types.js'
+import { requestChainSwitch, CHAIN_SWITCH_METHODS, chainHex } from './lib/wallets/chain-switch.js'
+import { AGREEMENT_VERSION, DEFAULT_CHAINS } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate } from './types.js'
 
 const splash          = document.getElementById('splash') as HTMLDivElement
@@ -59,6 +60,8 @@ function setPhase(phase: Phase) {
   websiteHost.classList.toggle('website-visible', phase === 'ok' && renderMode === 'website')
   rawView.classList.toggle('raw-visible', phase === 'ok' && renderMode === 'raw')
   verifyBadge.classList.toggle('hidden', phase !== 'ok')
+  chipVisible = phase === 'ok' && renderMode === 'website'
+  updateChainChip()
   if (phase !== 'ok') heliosBadge.classList.add('hidden')
   if (phase === 'ok') {
     verifyBadge.className = 'syncing'
@@ -307,7 +310,11 @@ let selectedWalletId: string | null = null
 let selectedWalletName: string = 'wallet'
 let connectInProgress = false
 let connectSuppressedUntil = 0
-let currentChainId = 1
+let currentChainId = 1   // the CONTENT chain: the w3:// URL's. Verification and the badge stay on it.
+// The chain the provider is on right now: starts as the URL's chain and a page can change it with
+// wallet_switchEthereumChain (see lib/wallets/chain-switch.ts). Drives eth_chainId, read routing,
+// broadcasts and the wallet-chain check. Reset on every navigation.
+let activeChainId = 1
 let currentPageUrl = ''
 let currentFragment = ''
 let pendingGatewayFallback = ''  // gateway URL to open if the target is an IPFS site
@@ -345,6 +352,117 @@ const FRAME_APPROVAL_METHODS = new Set([
   'wallet_switchEthereumChain', 'wallet_addEthereumChain',
 ])
 
+const chainChip = document.getElementById('chain-chip') as HTMLDivElement
+const statusRow = document.getElementById('status-row') as HTMLDivElement
+
+// The chip stays for as long as the site is on another network, so it can be dragged to any corner
+// (snapping on release) to keep it off the dapp's UI. The choice is remembered.
+type Corner = 'tl' | 'tr' | 'bl' | 'br'
+function placeChip(corner: Corner) {
+  chainChip.classList.remove('corner-tl', 'corner-tr', 'corner-br')
+  chainChip.style.cssText = ''
+  if (corner === 'bl') statusRow.appendChild(chainChip)       // beside the verify badge
+  else { document.body.appendChild(chainChip); chainChip.classList.add(`corner-${corner}`) }
+}
+chrome.storage.local.get('chainChipCorner').then(({ chainChipCorner }) => {
+  if (['tl', 'tr', 'bl', 'br'].includes(chainChipCorner as string)) placeChip(chainChipCorner as Corner)
+}).catch(() => {})
+chainChip.addEventListener('pointerdown', (down) => {
+  const box = chainChip.getBoundingClientRect()
+  const dx = down.clientX - box.left, dy = down.clientY - box.top
+  const startX = down.clientX, startY = down.clientY
+  chainChip.setPointerCapture(down.pointerId)
+  // Lift it out of its row/corner in place (re-parenting here would drop the pointer capture).
+  chainChip.classList.remove('corner-tl', 'corner-tr', 'corner-br')
+  chainChip.classList.add('dragging')
+  Object.assign(chainChip.style, { position: 'fixed', zIndex: '1000', left: `${box.left}px`, top: `${box.top}px`, right: 'auto', bottom: 'auto' })
+  const move = (e: PointerEvent) => {
+    chainChip.style.left = `${Math.min(Math.max(0, e.clientX - dx), innerWidth - box.width)}px`
+    chainChip.style.top = `${Math.min(Math.max(0, e.clientY - dy), innerHeight - box.height)}px`
+  }
+  const up = (e: PointerEvent) => {
+    chainChip.removeEventListener('pointermove', move)
+    chainChip.removeEventListener('pointerup', up)
+    chainChip.removeEventListener('pointercancel', up)
+    chainChip.classList.remove('dragging')
+    // A press that barely moved is a click: show or hide the explanation instead of moving the pill.
+    const clicked = Math.hypot(e.clientX - startX, e.clientY - startY) < 4
+    if (clicked) chainChip.classList.toggle('open')
+    const r = chainChip.getBoundingClientRect()
+    const corner = `${r.top + r.height / 2 < innerHeight / 2 ? 't' : 'b'}${r.left + r.width / 2 < innerWidth / 2 ? 'l' : 'r'}` as Corner
+    placeChip(corner)
+    chrome.storage.local.set({ chainChipCorner: corner }).catch(() => {})
+  }
+  chainChip.addEventListener('pointermove', move)
+  chainChip.addEventListener('pointerup', up)
+  chainChip.addEventListener('pointercancel', up)
+})
+
+// Chains Verum is configured for (settings, else the defaults) — the only ones a page may switch to.
+const chainNames = new Map<number, string>()
+// Seed with the defaults so the chip never shows a bare id before the stored settings have loaded.
+for (const [k, c] of Object.entries(DEFAULT_CHAINS)) chainNames.set(Number(k), (c as { name?: string }).name ?? `chain ${k}`)
+async function loadConfiguredChains(): Promise<Set<number>> {
+  let chains: Record<number, { name?: string }> = DEFAULT_CHAINS
+  try {
+    const stored = await chrome.storage.sync.get('chains')
+    if (stored.chains) chains = stored.chains as Record<number, { name?: string }>
+  } catch { /* fall back to the defaults */ }
+  const ids = new Set<number>()
+  for (const [k, c] of Object.entries(chains)) {
+    const n = Number(k)
+    if (Number.isInteger(n)) { ids.add(n); chainNames.set(n, c?.name ?? `chain ${n}`) }
+  }
+  return ids
+}
+
+// Shown for as long as a dapp is on screen, so the network its reads and transactions use is never
+// hidden. A dapp is a website that has made a provider or RPC request; static files and plain websites
+// never do, so they get no chip. It looks like the other pills; its tooltip says when the network differs
+// from the chain the page was loaded and verified from, so a switched page can't pass as the original.
+let chipVisible = false   // a website is being displayed (set by setPhase)
+let dappSeen = false      // ...and it has used the provider (set on its first eth-request, cleared on navigation)
+function updateChainChip() {
+  if (!chipVisible || !dappSeen) { chainChip.classList.add('hidden'); return }
+  const name = chainNames.get(activeChainId) ?? `chain ${activeChainId}`
+  const switched = activeChainId !== currentChainId
+  // The pill shows just the network; click it for the explanation.
+  const nameEl = document.createElement('span'); nameEl.textContent = name
+  const infoEl = document.createElement('span'); infoEl.className = 'chip-info'
+  infoEl.textContent = (switched
+    ? `This website switched to ${name}. It was loaded and verified from ${chainNames.get(currentChainId) ?? `chain ${currentChainId}`}; ` +
+      `its reads and transactions now use ${name}.`
+    : `This website's reads and transactions use ${name}.`) + ' Drag the pill to move it to another corner.'
+  chainChip.replaceChildren(nameEl, infoEl)
+  chainChip.classList.remove('hidden')
+}
+
+// wallet_switchEthereumChain / wallet_addEthereumChain from the page: change the provider's active chain.
+// A connected wallet switches too, with its own approval. Never accepts a page-supplied RPC.
+async function applyChainSwitch(params: unknown): Promise<{ result?: null; error?: string; code?: number }> {
+  const configured = await loadConfiguredChains()
+  const r = await requestChainSwitch(params, {
+    active: activeChainId,
+    configured,
+    walletConnected: !!selectedWalletId,
+    switchWallet: (want) => ensureWalletChain(walletCall, want, chainNames.get(want)),
+  })
+  if (!r.ok) return { error: r.error, code: r.code }
+  if (r.changed) {
+    activeChainId = r.chainId
+    chrome.runtime.sendMessage({ type: 'warmup-helios', chainId: activeChainId }).catch(() => {})
+    updateChainChip()
+    websiteFrame.contentWindow?.postMessage(
+      { type: 'wallet-event', method: 'chainChanged', params: [chainHex(activeChainId)] }, '*',
+    )
+  }
+  return { result: null }
+}
+
+// A chain switch resolves asynchronously (config lookup, optional wallet approval). Every other request waits for
+// it, so a read the page fires right after asking to switch is routed to the NEW chain, not the old one.
+let chainBarrier: Promise<unknown> = Promise.resolve()
+
 // One request to the selected wallet over a port (keeps the service worker alive while a wallet popup is
 // open — same pattern as the main request path below).
 function walletCall(method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
@@ -372,6 +490,13 @@ window.addEventListener('message', async (e) => {
   // pages get the polyfill too but won't make eth calls so the badge is irrelevant.
   if (e.data.type === 'polyfill-ready') {
     if (!pageHasScripts) return
+    // A page that switched network and then reloaded gets a fresh provider that starts on the URL's chain;
+    // tell it (silently) which chain is actually active.
+    if (activeChainId !== currentChainId) {
+      websiteFrame.contentWindow?.postMessage(
+        { type: 'wallet-event', method: 'chainSync', params: [chainHex(activeChainId)] }, '*',
+      )
+    }
     if (heliosIsReady) {
       websiteFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
     } else {
@@ -402,9 +527,14 @@ window.addEventListener('message', async (e) => {
 
   if (e.data.type !== 'eth-request') return
   const { id, method, params } = e.data
+  if (!dappSeen) {
+    dappSeen = true
+    updateChainChip()
+    loadConfiguredChains().then(updateChainChip).catch(() => {})   // the user's own chain names
+  }
 
-  const sendBack = (result: unknown, error?: string) =>
-    websiteFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error }, '*')
+  const sendBack = (result: unknown, error?: string, errorCode?: number) =>
+    websiteFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error, errorCode }, '*')
 
   // Raw-fetch broadcast: the polyfill's fetch shim rerouted an eth_sendRawTransaction that
   // the website POSTed straight to a hardcoded RPC (e.g. mevblocker). The tx is already signed;
@@ -417,16 +547,27 @@ window.addEventListener('message', async (e) => {
     const choice = await confirmBroadcast(rawTx, endpoint)
     if (!choice) { sendBack(undefined, 'User rejected the request.'); return }
     const resp = await chrome.runtime.sendMessage({
-      type: 'broadcast-raw-tx', chainId: currentChainId, rawTx, endpoint: choice.useEndpoint,
+      type: 'broadcast-raw-tx', chainId: activeChainId, rawTx, endpoint: choice.useEndpoint,
     })
     sendBack(resp?.result, resp?.error)
     return
   }
 
-  // eth_chainId can always be answered from the URL — no wallet connection needed.
+  // The page asks to change network. Verum's provider is the page's wallet, so it applies the switch itself
+  // (EIP-3326) instead of forwarding it: forwarding would only move the wallet, not Verum's routing.
+  if (CHAIN_SWITCH_METHODS.has(method)) {
+    const work = applyChainSwitch(params)        // assigned synchronously, before any later message is handled
+    chainBarrier = work.catch(() => undefined)
+    const r = await work
+    sendBack(r.result, r.error, r.code)
+    return
+  }
+  await chainBarrier
+
+  // eth_chainId can always be answered from the active chain — no wallet connection needed.
   // Returning "Not connected" here causes some websites to reset their connect UI.
   if (method === 'eth_chainId') {
-    sendBack('0x' + currentChainId.toString(16))
+    sendBack('0x' + activeChainId.toString(16))
     return
   }
 
@@ -446,11 +587,11 @@ window.addEventListener('message', async (e) => {
   } else if (!FRAME_APPROVAL_METHODS.has(method)) {
     // All eth_* reads always go through Helios regardless of wallet connection state —
     // ensures reads are verified against the URL's chain, not the wallet's active network.
-    const inflightKey = `${currentChainId}:${method}:${JSON.stringify(params)}`
+    const inflightKey = `${activeChainId}:${method}:${JSON.stringify(params)}`
     let p = ethReadInflight.get(inflightKey)
     if (!p) {
       p = new Promise<{ result?: unknown; error?: string }>((resolve, reject) => {
-        chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: currentChainId, method, params })
+        chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: activeChainId, method, params })
           .then(resolve, reject)
       })
       p.finally(() => ethReadInflight.delete(inflightKey))
@@ -518,7 +659,7 @@ window.addEventListener('message', async (e) => {
   // network per site, and can be on another one. Ask the wallet and switch it (with the user's approval)
   // BEFORE the transaction reaches it, instead of silently sending on the wrong chain.
   if (CHAIN_BOUND_METHODS.has(method) && selectedWalletId) {
-    const chainErr = await ensureWalletChain(walletCall, currentChainId)
+    const chainErr = await ensureWalletChain(walletCall, activeChainId, chainNames.get(activeChainId))
     if (chainErr) { sendBack(undefined, chainErr); return }
   }
 
@@ -703,6 +844,9 @@ async function navigate(web3Url: string, attempt = 0) {
     const defaultChain = (stored.defaultChain as number | undefined) ?? 1
     parsedUrl = parseWeb3URL(web3Url, defaultChain)
     currentChainId = parsedUrl.chainId
+    activeChainId = currentChainId
+    dappSeen = false
+    updateChainChip()
     // Host-only base for rewriting a website's self-referential share links (it builds them
     // from location.*, which is about:srcdoc in the sandbox). No path/hash — the website
     // appends its own.
@@ -752,7 +896,7 @@ async function navigate(web3Url: string, attempt = 0) {
     port.onMessage.addListener((msg: BgResponse) => {
       if (navToken !== navSeq) { resolve(); return }  // superseded — ignore this run's updates
       if (msg.type === 'error') {
-        // IPFS site verum can't serve (e.g. docs.zswap.wei) — open its gateway in a new
+        // IPFS site verum can't serve — open its gateway in a new
         // tab and return to the page we came from, instead of stranding the user on an
         // error screen. Only when we came from a gateway link that gave us a fallback URL.
         if (msg.ipfs && pendingGatewayFallback) {
@@ -994,7 +1138,7 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
   pageHasScripts = /<script[\s>]/i.test(html)
   // Detect the OS color scheme reliably here (extension page), and pass it to the sandbox.
   // In a freshly-created srcdoc iframe, matchMedia('(prefers-color-scheme:dark)') can
-  // return the wrong value at parse time, so websites reading it at init (zSwap) sometimes
+  // return the wrong value at parse time, so websites reading it at init sometimes
   // render light. The sandbox shims matchMedia to return this value consistently.
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
   sendToSandbox({ type: 'render', html, assetMap, chainId: currentChainId, pageUrl: currentPageUrl, fragment: currentFragment, prefersDark })

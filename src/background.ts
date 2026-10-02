@@ -1029,9 +1029,9 @@ async function twoPhaseResolve(
 //
 // Unlike the tx-calldata pipeline, the content is the return value of a view
 // eth_call — a current-state read. So verification is simply: re-run the same call
-// through Helios at the same pinned block and byte-compare. No trie/beacon/era, and
-// no 27h boundary (an immutable old version contract verifies at any age, since it's
-// just a current-state read of frozen bytecode).
+// through Helios at its verified head ('latest') and byte-compare with what was painted.
+// No trie/beacon/era, and no 27h boundary (a contract verifies at any age, since it's just
+// a current-state read).
 // ---------------------------------------------------------------------------
 
 async function resolveContractServed(
@@ -1084,22 +1084,21 @@ async function resolveContractServed(
   let content: ContractContent
   let blockNumber = 0
   let blockHash = ''
-  // Both the plain-RPC read and the Helios re-call use the 'finalized' tag — the same
-  // pattern the ENS re-verification uses, which Helios serves reliably. (A concrete
-  // historical block *number* is not reliably served by Helios and made the two reads
-  // land on different state, which surfaced as a false "differs from Helios".)
-  const blockTag = 'finalized'
+  // The plain-RPC read is pinned to the current head block (a concrete number — the plain RPC serves
+  // those), so the page paints immediately and a contract deployed seconds ago is readable. Helios
+  // then re-runs the call at its own verified head ('latest' tag, which it serves reliably) and the
+  // bodies are byte-compared. This is the same assurance as the calldata path's recent-block mode;
+  // 'finalized' would trail the tip by ~13 minutes and hide a fresh deployment.
   try {
     const fastRpc = new RpcClient(execRpcs)
-    // Finalized block is only for the proof panel's block number/hash — not the call tag.
-    const fin = await fastRpc.request<{ number: string; hash: string }>('eth_getBlockByNumber', ['finalized', false])
-    blockNumber = parseInt(fin.number, 16)
-    blockHash = fin.hash
-    content = await fetchContractContent(fastRpc, address, parsed.path, blockTag)
+    const head = await fastRpc.request<{ number: string; hash: string }>('eth_getBlockByNumber', ['latest', false])
+    blockNumber = parseInt(head.number, 16)
+    blockHash = head.hash
+    content = await fetchContractContent(fastRpc, address, parsed.path, head.number)
   } catch (err) {
     if (tabId) clearBadge(tabId)
     // The contract didn't serve web3 content. If this was a NAME and it has an IPFS
-    // contenthash, it's a traditional IPFS site (e.g. docs.zswap.wei) that verum can't
+    // contenthash, it's a traditional IPFS site that verum can't
     // serve — flag it so the renderer opens the original gateway URL instead of erroring.
     // Only a real IPFS contenthash triggers this, not any resolution failure.
     let ipfs = false
@@ -1128,7 +1127,7 @@ async function resolveContractServed(
   if (!tabId) return
   if (isSuperseded()) { port.disconnect(); return }
 
-  // ── Phase 2: re-run through Helios at the same block, byte-compare ────────
+  // ── Phase 2: re-run through Helios at its verified head, byte-compare ─────
   let update: VerificationUpdate
   try {
     if (chain.localMode) {
@@ -1144,23 +1143,34 @@ async function resolveContractServed(
       let verified: ContractContent | undefined
       let heliosBackedFlag = false
       let lastErr: unknown
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Helios's head can trail the plain RPC's by a block or more, so right after a deployment (or a
+      // state change) it may not see the contract / the new state yet. Both resolve by waiting a little,
+      // so retry those a few times before treating them as unverified / a mismatch.
+      let behindRetries = 0
+      for (let attempt = 0; attempt < 8; attempt++) {
         const heliosRpc = await Promise.race([
           getOrCreateRpc(chain),
           new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
         ]).catch(() => undefined)
         if (!heliosRpc) { lastErr = new Error('Helios not available (35s timeout — still syncing or consensus RPC unreachable)'); break }
         try {
-          verified = await fetchContractContent(heliosRpc, address, parsed.path, blockTag)
+          verified = await fetchContractContent(heliosRpc, address, parsed.path, 'latest')
           heliosBackedFlag = heliosRpc.isHeliosBacked()
-          break
+          if (bytesEqual(verified.body, content.body) || behindRetries >= 3) break
+          behindRetries++
+          w3log(`[w3] Contract-served — Helios differs from the plain read; waiting for its head to catch up (${behindRetries}/3)`)
+          await new Promise(r => setTimeout(r, 5000))
         } catch (e) {
           lastErr = e
           const m = ((e as Error)?.message ?? '').toLowerCase()
           const transient = m.includes('shut down') || m.includes('out of sync') || m.includes('wasm call timeout')
-          if (!transient) throw e
-          console.warn(`[w3] Contract-served — Helios instance restarted mid-verify (attempt ${attempt + 1}) — retrying`)
-          await new Promise(r => setTimeout(r, 1500))
+          // The plain read found the contract, so "not a web3:// site" from Helios means its head hasn't
+          // reached the deployment block yet.
+          const notYetVisible = m.includes('does not implement') || m.includes('is not a web3://')
+          if (!transient && !(notYetVisible && behindRetries < 6)) throw e
+          if (notYetVisible) behindRetries++
+          console.warn(`[w3] Contract-served — Helios ${transient ? 'instance restarted' : 'head behind the deployment'} (attempt ${attempt + 1}) — retrying`)
+          await new Promise(r => setTimeout(r, transient ? 1500 : 5000))
         }
       }
       if (!verified) throw lastErr ?? new Error('Helios verification failed')

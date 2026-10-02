@@ -8,10 +8,10 @@ import { w3log } from '../log'
 //                        → (uint16 statusCode, string body, KeyValue[] headers)
 //   else    → ERC-8244  html() → string   (used as a fallback)
 //
-// The read is a plain view eth_call, so it is a *current-state* read: Helios verifies
-// it against the finalized state root at any contract age — no beacon/era path, no 27h
-// boundary. The verification (in background.ts) re-runs the same call through Helios at
-// the same pinned block and byte-compares the body.
+// The read is a plain view eth_call, so it is a *current-state* read: no trie/beacon/era path and no
+// 27h boundary, so it works at any contract age. The page is painted from a plain-RPC read at the
+// current head block; the verification (in background.ts) then re-runs the same call through Helios
+// at its own verified head ('latest') and byte-compares the body.
 
 import { Interface, getBytes } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
@@ -25,7 +25,7 @@ const iface = new Interface([
 export interface ContractContent {
   body: Uint8Array
   contentType: string
-  cacheControl?: string   // ERC-5219 header: "immutable" ⇒ pinned artifact, else live
+  cacheControl?: string   // ERC-5219 header as declared by the contract; unverified, so it is not surfaced as a guarantee
   statusCode?: number
   mode: '5219' | 'html'
 }
@@ -90,9 +90,9 @@ async function readResolveMode(rpc: IVerifiedRpc, to: string, block: string): Pr
   }
 }
 
-// Fetch a contract-served page at a pinned block. `block` must be a concrete tag both
-// the plain and Helios calls agree on (e.g. the finalized block number) so the later
-// byte-compare is deterministic even for pages whose state changes block to block.
+// Fetch a contract-served page. `block` is a block tag or number: the plain-RPC read passes the head
+// block's number, the Helios re-call passes 'latest'. The two can land on different blocks, so the
+// caller retries a mismatch briefly before treating it as one (a live page may change block to block).
 export async function fetchContractContent(
   rpc: IVerifiedRpc,
   address: string,
@@ -142,7 +142,7 @@ export async function fetchContractContent(
 
   // Prefer request() when resolveMode advertises 5219; otherwise try both interfaces
   // opportunistically — some contracts implement request()/html() without setting
-  // resolveMode to "5219" (e.g. docs.zswap.wei reverts on html() but may serve request()).
+  // resolveMode to "5219" (a contract may revert on html() yet serve request()).
   const order = mode === '5219' ? [tryRequest, tryHtml] : [tryHtml, tryRequest]
   for (const attempt of order) {
     const r = await attempt()

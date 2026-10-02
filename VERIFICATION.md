@@ -21,7 +21,7 @@ Name-based URLs (`w3://myapp.eth`, `w3://myapp.gwei`) require `ensOk` thourgh he
 
 | Step | Check | Location |
 |---|---|---|
-| Name → `[[block, txIndex]]` | ENS: `registry.resolver(node)` + `text(node,"w3")`; GNS (.gwei): `text()` directly on NameNFT — via plain RPC at the `finalized` tag. Not yet trusted; re-verified per mode below | `src/lib/w3/name-resolver.ts` — `resolveEns:113`, `getResolver:67`, `getText:76`, `ethCall`(finalized)`:62` |
+| Name → `[[block, txIndex]]` | ENS: `registry.resolver(node)` + `text(node,"w3")`; GNS (.gwei): `text()` directly on NameNFT — via plain RPC at the `latest` tag. Not yet trusted; re-verified per mode below | `src/lib/w3/name-resolver.ts` — `resolveEns:113`, `getResolver:67`, `getText:76`, `ethCall`(latest)`:62` |
 | Calldata parsing | W3FS magic, version, chunk index/count, decompression — structural validation, not proof (the content *is* the tx data) | `src/lib/w3/content.ts:58` (`parseCalldata`), `:141` (`assembleContent`) |
 | Calldata ∈ tx ∈ trie | `serializeTx` re-encodes every tx (incl. `tx.input` = the calldata) as trie leaves; recomputed root must equal `block.transactionsRoot`, else throw. Rendered bytes come from the same tx object | `src/lib/verify/tx-verifier.ts:257-258` (leaves + trie root in `getVerifiedCalldataByLocation`), `:271` (rendered bytes = `tx.input`) |
 
@@ -54,7 +54,7 @@ Badge green requires `heliosBacked && trieVerified && ensOk` (`src/background.ts
 | Header → canonical chain | Helios serves `eth_getBlockByNumber` only after verifying it against its sync-committee-verified chain (EIP-2935 window, ~last 27h); Helios's own consensus verification is the anchor — **run per chunk, all chunks** | `src/background.ts` (Helios phase-2 loop over `phase1Results`), `src/lib/verify/tx-verifier.ts` (`headerVerified: rpc.isHeliosBacked()`) |
 | Trie rebuild (again, via Helios data) | Same full-trie reconstruction as phase 1, but over the Helios-served block — per chunk | `src/lib/verify/tx-verifier.ts` (`getVerifiedCalldataByLocation`) |
 | **Render binding** | Byte-for-byte comparison of each chunk's Helios-verified calldata against the bytes phase 1 actually rendered — a fast RPC serving a self-consistent forgery in phase 1 fails here (✗) instead of being green-lit by verifying canon at the same coordinates | `src/background.ts` (`bytesEqual` check in the Helios phase-2 loop) |
-| ENS/GNS re-verification | Name re-resolved through a Helios-verified `eth_call` at `finalized`; chunk lists must match phase 1 | `src/lib/w3/name-resolver.ts:104` (`compareEnsChunks`), called from `src/background.ts` |
+| ENS/GNS re-verification | Name re-resolved through a Helios-verified `eth_call` at Helios's verified head (`latest`); chunk lists must match phase 1 | `src/lib/w3/name-resolver.ts:104` (`compareEnsChunks`), called from `src/background.ts` |
 
 ## Mode 2 — Historical block, beacon-verified
 

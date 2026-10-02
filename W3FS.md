@@ -75,15 +75,15 @@ The extension fetches and verifies each transaction independently, then concaten
 ### Direct calldata reference
 
 ```
-w3://[<chainId>:]<blockNumber>:<txIndex>[+<blockNumber>:<txIndex>...][/path]
+w3://<blockNumber>:<txIndex>[+<blockNumber>:<txIndex>...][:<chainId>][/path]
 ```
 
-Points straight at one or more calldata chunks by their `blockNumber:txIndex` coordinates — no name lookup. Multiple chunks are joined with `+` in ascending chunk order. The chain id, when present, is a **leading** `<chainId>:` prefix (verum-specific; a direct reference is not an ERC-4804 host).
+Points straight at one or more calldata chunks by their `blockNumber:txIndex` coordinates — no name lookup. Multiple chunks are joined with `+` in ascending chunk order. The chain id, when present, is a **trailing** `:<chainId>`, the same as for names and contract addresses.
 
 ```
 w3://19000000:12                      single chunk, mainnet
 w3://19000000:12+19000000:13          two-chunk file
-w3://11155111:8402190:5               single chunk on Sepolia
+w3://8402190:5:11155111               single chunk on Sepolia
 ```
 
 ## Multi-file bundles

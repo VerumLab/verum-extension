@@ -129,8 +129,8 @@ function showProof(d: any) {
   showRow('pf-block-row', !multiChunk)
   showRow('pf-block-hash-row', !multiChunk)
   showRow('pf-source-row', true)
-  // Transaction calldata is immutable; contracts may instead serve a live state or
-  // an explicitly pinned artifact. Show the same freshness property for every path.
+  // Transaction calldata is immutable; a contract serves its current state. Show the same freshness
+  // property for every path.
   showRow('pf-fresh-row', true)
   showRow('pf-name-row', isEns && !d.localMode)   // resolution — dotted-name targets of either kind
 
@@ -155,8 +155,8 @@ function showProof(d: any) {
     d.trieVerified   ? 'YES — cryptographically proven' : 'NO')
 
   if (contractServed) {
-    const immutable = typeof d.cacheControl === 'string' && /immutable/i.test(d.cacheControl)
-    set('pf-fresh', pending ? 'Verifying…' : immutable ? 'Immutable — pinned artifact' : 'Live — current contract state')
+    // A contract's own Cache-Control claim (e.g. "immutable") can't be verified, so it never changes this label.
+    set('pf-fresh', pending ? 'Verifying…' : 'Live — current contract state')
   } else {
     set('pf-fresh', pending ? 'Verifying…' : 'Immutable — transaction calldata')
   }

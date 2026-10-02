@@ -66,8 +66,8 @@ async function readRefs() {
 }
 
 function browseUrl(chainId, name) {
-  const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
-  return `w3://${chainPrefix}${name}`
+  const chainSuffix = chainId.toString() === '1' ? '' : `:${chainId}`
+  return `w3://${name}${chainSuffix}`
 }
 
 // --- Name services whose NameNFT is registry+resolver in one (GNS, WNS) ---

@@ -181,3 +181,26 @@ button.linkish:disabled { opacity: 0.5; cursor: default; }
 #name-done p { color: var(--green); }
 
 .hidden { display: none !important; }
+
+/* Shown while the previewed website runs on another chain than the deploy target (it switched network at runtime). */
+/* Network chip over the preview's bottom-left corner, like the viewer's */
+#preview-chain-note {
+  position: absolute; bottom: 14px; left: 14px; z-index: 10; max-width: calc(100% - 28px);
+  background: rgba(22,27,34,0.92); backdrop-filter: blur(8px);
+  border: 1px solid var(--border); border-radius: 20px;
+  padding: 5px 14px; font-size: 12px; color: var(--text-muted); cursor: pointer;
+}
+#preview-chain-note .chip-info { display: none; margin-top: 4px; max-width: 260px; font-size: 11px; line-height: 1.4; white-space: normal; }
+#preview-chain-note.open .chip-info { display: block; }
+#preview-chain-note.open { border-radius: 12px; }
+#preview-chain-note.hidden { display: none; }
+@media (prefers-color-scheme: light) {
+  #preview-chain-note { background: rgba(255,255,255,0.94); border-color: #d0d7de; color: #57606a; }
+}
+
+/* Storage selector (calldata / contract code) */
+#storage-mode { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.storage-opt { flex: 1 1 240px; display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--text-muted); }
+.storage-opt:has(input:checked) { border-color: var(--accent); color: var(--text); }
+.storage-opt:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.storage-opt input { margin-top: 3px; }

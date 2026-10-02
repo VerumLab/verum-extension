@@ -241,7 +241,7 @@ export interface VerificationUpdate {
     chunks?: Array<{ blockNumber: number; txIndex: number; txHash: string }>
     // Contract-served (ERC-5219/8244) targets only.
     contractAddress?: string
-    cacheControl?: string   // ERC-5219 Cache-Control header: "immutable" ⇒ pinned artifact
+    cacheControl?: string   // ERC-5219 Cache-Control header as declared by the contract (unverified; not shown as a guarantee)
   }
 }
 

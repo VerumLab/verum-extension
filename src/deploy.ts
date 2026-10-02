@@ -1,9 +1,9 @@
-// Deploy page — publish a file or folder as W3FS calldata from the extension.
+// Deploy page — publish a file or folder as W3FS calldata, or one HTML file as contract code, from the extension.
 // Wizard: select → preview (same sandbox as the renderer) → deploy via wallet
 // (MetaMask/Frame through the existing background bridges) → verify through the
 // normal web3-resolve pipeline → optionally link an owned .eth/.gwei/.wei name.
 
-import { Interface, ensNormalize, namehash } from 'ethers'
+import { Interface, ensNormalize, namehash, getBytes, ZeroAddress } from 'ethers'
 import { formatWeb3URL } from './lib/w3/url-parser.js'
 import { buildWebsiteHtml } from './lib/w3/website-html.js'
 import type { BundleFile } from './lib/w3/content.js'
@@ -13,6 +13,10 @@ import {
 } from './lib/w3/encoder.js'
 import { DEFAULT_CHAINS, type BgResponse, type ChainConfig } from './types.js'
 import { ensureWalletChain, CHAIN_BOUND_METHODS } from './lib/wallets/chain-guard.js'
+import {
+  dataContractInitcode, siteInitcode, splitIntoDataContracts, dataContractGas, siteContractGas,
+} from './lib/w3/site-contract.js'
+import { requestChainSwitch, CHAIN_SWITCH_METHODS, chainHex } from './lib/wallets/chain-switch.js'
 
 // ---------------------------------------------------------------------------
 // Elements
@@ -72,7 +76,39 @@ let account: string | null = null
 let nextTxIndex = 0                      // resume point for retry
 let coords: Array<{ blockNumber: number; txIndex: number }> = []
 let deployedUrl = ''
+// Storage mode: W3FS calldata (default), or contract code for a single self-contained HTML file —
+// data contracts (0x00 + a slice of the file) plus a VerumSite contract whose html() returns it (ERC-8244).
+let storageMode: 'calldata' | 'contract' = 'calldata'
+let dataSlices: Uint8Array[] = []        // contract mode: the file split into data-contract slices
+let contractAddrs: string[] = []         // contract mode: data contracts deployed so far, in order
+let siteAddress = ''                     // contract mode: the VerumSite address once deployed
+let deployBlock = 0                      // contract mode: block of the last (site) transaction
 let allChains: Record<number, ChainConfig> = {}
+// The chain the PREVIEWED website is on. null = follow the selector (the chain being deployed to). A website that
+// switches network at runtime (wallet_switchEthereumChain) moves only this, never the deploy target.
+let previewChainId: number | null = null
+// Resolves when the latest runtime chain switch has been applied; the bridge awaits it before routing anything else.
+let chainBarrier: Promise<unknown> = Promise.resolve()
+const previewActiveChain = () => previewChainId ?? chain?.chainId ?? 1
+let previewShowsWebsite = false   // the preview is rendering a website (not the raw view)
+let previewDappSeen = false       // ...and it has made a provider/RPC request, i.e. it is a dapp
+document.getElementById('preview-chain-note')?.addEventListener('click', (e) => (e.currentTarget as HTMLElement).classList.toggle('open'))
+function updatePreviewChainNote() {
+  const note = document.getElementById('preview-chain-note')
+  if (!note) return
+  if (!previewShowsWebsite || !previewDappSeen) { note.classList.add('hidden'); return }
+  const id = previewActiveChain()
+  const switched = id !== chain?.chainId
+  const name = allChains[id]?.name ?? String(id)
+  // Just the network on the pill; click it for the explanation.
+  const nameEl = document.createElement('span'); nameEl.textContent = name
+  const infoEl = document.createElement('span'); infoEl.className = 'chip-info'
+  infoEl.textContent = switched
+    ? `The website switched network at runtime. Preview reads use ${name}; the deploy target stays ${chain?.name ?? 'the selected chain'}.`
+    : `Preview reads use ${name}.`
+  note.replaceChildren(nameEl, infoEl)
+  note.classList.remove('hidden')
+}
 
 // ---------------------------------------------------------------------------
 // Boot: chain selector + warm up Helios for the verification step later
@@ -97,6 +133,8 @@ boot()
 
 function selectChain(chainId: number) {
   chain = allChains[chainId]
+  previewChainId = null
+  updatePreviewChainNote()
   if (chain && !chain.localMode) {
     chrome.runtime.sendMessage({ type: 'warmup-helios', chainId: chain.chainId }).catch(() => {})
   }
@@ -106,18 +144,54 @@ function selectChain(chainId: number) {
 // it persists and w3:// navigation without a chainId prefix uses it too.
 chainSelect.addEventListener('change', () => {
   const chainId = parseInt(chainSelect.value, 10)
+  if (!confirmDiscardDeploy()) { chainSelect.value = String(chain?.chainId ?? chainId); return }
+  if (hasDeployProgress()) resetDeployProgress()
   chrome.storage.sync.set({ defaultChain: chainId })
   selectChain(chainId)
   // A wallet connected to the old chain must re-switch before the next tx;
   // ensureChain() handles that, but drop the cost estimate's stale gas price.
-  if (calldatas.length > 0) estimateCost()
+  if (calldatas.length > 0) renderSummary()
 })
 
-// Once the first transaction is sent the coordinates are bound to that chain —
-// switching mid-deploy would produce a URL pointing at the wrong network.
-function lockChainSelector() {
-  chainSelect.disabled = true
-  chainLocked.classList.remove('hidden')
+// While transactions are being sent the chain and storage selectors are locked — switching mid-send
+// would bind the coordinates/addresses to the wrong network or layout. They unlock as soon as the send
+// loop ends (finished, failed or waiting for a retry); changing either then starts a fresh deployment.
+function setDeploying(on: boolean) {
+  chainSelect.disabled = on
+  chainLocked.classList.toggle('hidden', !on)
+  document.querySelectorAll<HTMLInputElement>('input[name="storage"]').forEach(r => {
+    r.disabled = on || (r.value === 'contract' && !contractEligible())
+  })
+}
+
+const deployFinished = () => stepDeploy.classList.contains('done')
+const hasDeployProgress = () => nextTxIndex > 0 || !stepDeploy.classList.contains('hidden')
+
+// Drop everything a previous deployment left behind (progress, addresses, steps 3-5) so the next one
+// starts clean. Transactions already sent stay on-chain; they are just no longer tracked here.
+function resetDeployProgress() {
+  verifySettled = true                     // ignore a verification still running for the old deployment
+  nextTxIndex = 0
+  coords = []
+  contractAddrs = []
+  siteAddress = ''
+  deployBlock = 0
+  deployedUrl = ''
+  txList.innerHTML = ''
+  showDeployError(null)
+  retryDeploy.classList.add('hidden')
+  openLink.classList.add('hidden')
+  for (const s of [stepPreview, stepDeploy, stepVerify, stepName]) s.classList.remove('done')
+  for (const s of [stepDeploy, stepVerify, stepName]) s.classList.add('hidden')
+  nameDone.classList.add('hidden')
+  setNameStatus('', '')
+  setDeploying(false)
+}
+
+// Ask before abandoning a deployment that is only partly sent; a finished one is just replaced.
+function confirmDiscardDeploy(): boolean {
+  if (nextTxIndex === 0 || deployFinished()) return true      // nothing sent yet, or already complete
+  return confirm('A deployment is partly sent. Switching starts a new deployment; the transactions already sent stay on-chain. Continue?')
 }
 
 // ---------------------------------------------------------------------------
@@ -208,11 +282,38 @@ async function selectFolderFiles(files: File[]) {
   await selectEntries(collected, root, true)
 }
 
+// Contract code holds exactly one self-contained HTML document.
+const contractEligible = () => !isDirectory && entries.length === 1 && /^text\/html\b/i.test(entries[0].mime)
+
+function updateStorageOptions() {
+  const radio = (v: string) => document.querySelector<HTMLInputElement>(`input[name="storage"][value="${v}"]`)!
+  const eligible = contractEligible()
+  radio('contract').disabled = !eligible
+  $('storage-opt-contract').title = eligible ? '' : 'Contract code needs a single self-contained HTML file.'
+  dataSlices = eligible ? splitIntoDataContracts(entries[0].data) : []
+  if (!eligible) storageMode = 'calldata'
+  radio(storageMode).checked = true
+}
+
+document.querySelectorAll<HTMLInputElement>('input[name="storage"]').forEach(r =>
+  r.addEventListener('change', () => {
+    if (!r.checked) return
+    const next = r.value as 'calldata' | 'contract'
+    if (!confirmDiscardDeploy()) {
+      document.querySelector<HTMLInputElement>(`input[name="storage"][value="${storageMode}"]`)!.checked = true
+      return
+    }
+    if (hasDeployProgress()) resetDeployProgress()
+    storageMode = next
+    renderSummary()
+  }))
+
 async function selectEntries(files: DeployFile[], label: string, dir: boolean) {
   entries = [...files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   isDirectory = dir
   selectionLabel = label
   await encodeSelection()
+  updateStorageOptions()
   renderSummary()
   renderPreview()
   stepSelect.classList.add('done')
@@ -301,6 +402,18 @@ async function probeMaxCalldata(): Promise<number> {
   }
 }
 
+const txCount = () => storageMode === 'contract' ? dataSlices.length + 1 : calldatas.length
+
+// Gas limits for the whole deployment. Contract mode: one creation tx per data slice plus the site contract.
+function totalGasLimit(): bigint {
+  if (storageMode === 'contract') {
+    const data = dataSlices.reduce((n, s) => n + dataContractGas(dataContractInitcode(s), s.length), 0n)
+    const site = siteContractGas(getBytes(siteInitcode(dataSlices.map(() => ZeroAddress))), dataSlices.length)
+    return data + site
+  }
+  return calldatas.reduce((n, c) => n + txGasLimit(c), 0n)
+}
+
 function renderSummary() {
   $('sum-content').textContent = isDirectory
     ? `${selectionLabel}/ (folder)`
@@ -308,8 +421,10 @@ function renderSummary() {
   $('sum-files-row').classList.toggle('hidden', !isDirectory)
   if (isDirectory) $('sum-files').textContent = `${entries.length} files`
   $('sum-raw').textContent = fmtBytes(rawSize)
-  $('sum-onchain').textContent = `${fmtBytes(onchainSize)} calldata`
-  $('sum-txs').textContent = String(calldatas.length)
+  $('sum-onchain').textContent = storageMode === 'contract'
+    ? `${fmtBytes(rawSize)} contract code`
+    : `${fmtBytes(onchainSize)} calldata`
+  $('sum-txs').textContent = String(txCount())
   estimateCost()
 }
 
@@ -317,7 +432,7 @@ async function estimateCost() {
   const costEl = $('sum-cost')
   costEl.textContent = '…'
   if (!chain) { costEl.textContent = '—'; return }
-  const totalGas = calldatas.reduce((n, c) => n + txGasLimit(c), 0n)
+  const totalGas = totalGasLimit()
   const rpc = (method: string, params: unknown[]) =>
     chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: chain!.chainId, method, params }) as Promise<{ result?: any; error?: string }>
   try {
@@ -345,8 +460,8 @@ async function estimateCost() {
     if (fastFee === 0n) throw new Error('no fee data')
     const fmtEth = (w: bigint) => (Number(w) / 1e18).toFixed(5)
     costEl.textContent = slowFee === fastFee || slowFee === 0n
-      ? `~${fmtEth(totalGas * fastFee)} ETH (${totalGas.toLocaleString()} gas)`
-      : `~${fmtEth(totalGas * slowFee)}–${fmtEth(totalGas * fastFee)} ETH (${totalGas.toLocaleString()} gas · slow–fast)`
+      ? `~${fmtEth(totalGas * fastFee)} ETH`
+      : `slow ~${fmtEth(totalGas * slowFee)} ETH · fast ~${fmtEth(totalGas * fastFee)} ETH`
   } catch {
     costEl.textContent = `${totalGas.toLocaleString()} gas (gas price unavailable)`
   }
@@ -357,6 +472,10 @@ const previewReady = new Promise<void>((resolve) =>
   previewFrame.addEventListener('load', () => resolve(), { once: true }),
 )
 function sendToPreview(html: string, assetMap: Record<string, string> = {}) {
+  previewChainId = null
+  previewShowsWebsite = true
+  previewDappSeen = false
+  updatePreviewChainNote()
   previewRaw.classList.add('hidden')
   previewFrame.classList.remove('hidden')
   // Hand the sandbox the OS color scheme, as the viewer does (renderer.ts). The sandbox overrides
@@ -370,6 +489,8 @@ function sendToPreview(html: string, assetMap: Record<string, string> = {}) {
 function showRawPreview(build: (host: HTMLElement) => void) {
   previewFrame.classList.add('hidden')
   previewRaw.classList.remove('hidden')
+  previewShowsWebsite = false
+  updatePreviewChainNote()
   previewRaw.innerHTML = ''
   build(previewRaw)
 }
@@ -485,16 +606,39 @@ window.addEventListener('message', async (e) => {
   if (!e.data || e.source !== previewFrame.contentWindow) return
   if (e.data.type !== 'eth-request') return
   const { id, method, params } = e.data
+  if (!previewDappSeen) { previewDappSeen = true; updatePreviewChainNote() }
   // Reply once: a failed chain check answers the request itself, and the caller then returns.
   let replied = false
-  const reply = (result?: unknown, error?: string) => {
+  const reply = (result?: unknown, error?: string, errorCode?: number) => {
     if (replied) return
     replied = true
-    previewFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error }, '*')
+    previewFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error, errorCode }, '*')
   }
 
-  // Answerable without a wallet — the URL's chain is authoritative.
-  if (method === 'eth_chainId') { reply('0x' + (chain?.chainId ?? 1).toString(16)); return }
+  if (CHAIN_SWITCH_METHODS.has(method)) {
+    const work = requestChainSwitch(params, {
+      active: previewActiveChain(),
+      configured: new Set(Object.keys(allChains).map(Number)),
+      walletConnected: !!account,
+      switchWallet: (want) => ensureWalletChain(walletRpc, want, allChains[want]?.name),
+    })
+    chainBarrier = work.catch(() => undefined)   // assigned synchronously, before any later message is handled
+    const r = await work
+    if (!r.ok) { reply(undefined, r.error, r.code); return }
+    if (r.changed) {
+      previewChainId = r.chainId
+      if (!allChains[r.chainId]?.localMode) chrome.runtime.sendMessage({ type: 'warmup-helios', chainId: r.chainId }).catch(() => {})
+      updatePreviewChainNote()
+      previewFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'chainChanged', params: [chainHex(r.chainId)] }, '*')
+    }
+    reply(null)
+    return
+  }
+
+  await chainBarrier   // a switch still in flight must land before anything else is routed
+
+  // Answerable without a wallet — the previewed chain is authoritative (the selector's, unless the page switched).
+  if (method === 'eth_chainId') { reply('0x' + previewActiveChain().toString(16)); return }
   if (method === 'eth_accounts') {
     // Ask the wallet, so a switch made in MetaMask reaches the previewed website.
     if (!account) { reply([]); return }
@@ -506,7 +650,7 @@ window.addEventListener('message', async (e) => {
   if (CONNECT_METHODS.has(method)) {
     // Always through ensureWallet: it connects when needed AND verifies the wallet's chain, including when
     // an account is already connected (the wallet may since have been left on another network).
-    const connected = await ensureWallet(msg => reply(undefined, msg))
+    const connected = await ensureWallet(msg => reply(undefined, msg), previewActiveChain())
     if (!connected) { reply(undefined, 'User rejected wallet selection'); return }
     const resp = await walletRpc(method, params ?? [])
     if (!resp.error && Array.isArray(resp.result)) notifyPreviewAccounts(resp.result)
@@ -518,7 +662,7 @@ window.addEventListener('message', async (e) => {
     if (!account) { reply(undefined, 'Not connected'); return }
     // The page believes it is on the preview's chain (eth_chainId above is answered from the selector), but the
     // wallet decides its own network per site. Make sure a send goes out on the chain being previewed.
-    if (CHAIN_BOUND_METHODS.has(method) && !(await ensureChain(msg => reply(undefined, msg)))) return
+    if (CHAIN_BOUND_METHODS.has(method) && !(await ensureChain(msg => reply(undefined, msg), previewActiveChain()))) return
     const resp = await walletRpc(method, params ?? [])
     reply(resp.result, resp.error)
     return
@@ -527,11 +671,20 @@ window.addEventListener('message', async (e) => {
   // All other eth_* reads → background (Helios-verified, same as the renderer).
   try {
     const resp = await chrome.runtime.sendMessage({
-      type: 'eth-rpc', chainId: chain?.chainId ?? 1, method, params,
+      type: 'eth-rpc', chainId: previewActiveChain(), method, params,
     }) as { result?: unknown; error?: string } | undefined
     reply(resp?.result, resp?.error ?? (resp ? undefined : 'no response'))
   } catch (err: any) {
     reply(undefined, err?.message ?? 'eth-rpc unavailable')
+  }
+})
+
+// A previewed page that switched network and then reloaded gets a fresh provider on the selector's chain:
+// tell it (silently) which chain is actually active.
+window.addEventListener('message', (e) => {
+  if (e.source !== previewFrame.contentWindow || e.data?.type !== 'polyfill-ready') return
+  if (previewChainId !== null && previewChainId !== chain?.chainId) {
+    previewFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'chainSync', params: [chainHex(previewChainId)] }, '*')
   }
 })
 
@@ -544,8 +697,8 @@ $('change-selection').addEventListener('click', () => {
   sendToPreview('')  // clear stale website
   entries = []
   calldatas = []
-  coords = []
-  nextTxIndex = 0
+  dataSlices = []
+  resetDeployProgress()
   stepSelect.scrollIntoView({ behavior: 'smooth' })
 })
 
@@ -557,7 +710,12 @@ $('start-deploy').addEventListener('click', async () => {
   stepPreview.classList.add('done')
   stepDeploy.classList.remove('hidden')
   stepDeploy.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  if (!account) await showWalletPicker()
+  showDeployError(null)
+  if (!account) { await showWalletPicker(); return }   // the picker starts the deployment once a wallet is connected
+  // Already connected (e.g. a second deployment in the same session): there is no picker to start it, so
+  // check the wallet is on the deploy chain and send straight away.
+  if (!await ensureChain(showDeployError)) { retryDeploy.classList.remove('hidden'); return }
+  await runDeploy()
 })
 
 const WALLET_ICONS: Record<string, { file: string; style?: string }> = {
@@ -608,7 +766,7 @@ async function showWalletPicker() {
       showDeployError(null)
       if (!await connectAccount(w.id, w.name)) return
       if (!await ensureChain(showDeployError)) { retryDeploy.classList.remove('hidden'); return }
-      await sendTransactions()
+      await runDeploy()
     }))
   }
 }
@@ -755,22 +913,23 @@ nameSwitchBtn.addEventListener('click', async () => {
 
 // Connect on demand (modal) and put the wallet on the configured chain.
 // Returns the connected account, or null if the user cancelled / it failed.
-async function ensureWallet(onError: (msg: string) => void): Promise<string | null> {
+async function ensureWallet(onError: (msg: string) => void, chainId?: number): Promise<string | null> {
   if (account) {
-    return await ensureChain(onError) ? account : null
+    return await ensureChain(onError, chainId) ? account : null
   }
   const picked = await pickWalletModal()
   if (!picked) return null
   if (!await connectAccount(picked.id, picked.name)) return null
-  if (!await ensureChain(onError)) return null
+  if (!await ensureChain(onError, chainId)) return null
   return account
 }
 
-async function ensureChain(onError: (msg: string) => void): Promise<boolean> {
+async function ensureChain(onError: (msg: string) => void, chainId?: number): Promise<boolean> {
   if (!chain) { onError('No chain configured'); return false }
+  const want = chainId ?? chain.chainId
   // Asks the WALLET which chain it will use for this site (MetaMask picks per site, so it can differ from
   // the network shown in its UI) and switches it if needed — see lib/wallets/chain-guard.ts.
-  const err = await ensureWalletChain(walletRpc, chain.chainId, chain.name)
+  const err = await ensureWalletChain(walletRpc, want, allChains[want]?.name)
   if (err) { onError(err); return false }
   return true
 }
@@ -780,7 +939,7 @@ retryDeploy.addEventListener('click', async () => {
   showDeployError(null)
   if (!account) { await showWalletPicker(); return }
   if (!await ensureChain(showDeployError)) { retryDeploy.classList.remove('hidden'); return }
-  await sendTransactions()
+  await runDeploy()
 })
 
 function showDeployError(msg: string | null) {
@@ -793,7 +952,11 @@ function txListItem(i: number): HTMLLIElement {
   if (!li) {
     li = document.createElement('li')
     const label = document.createElement('span')
-    label.textContent = `tx ${i + 1}/${calldatas.length} — ${fmtBytes(calldatas[i].length)}`
+    label.textContent = storageMode === 'contract'
+      ? (i < dataSlices.length
+          ? `data contract ${i + 1}/${dataSlices.length} — ${fmtBytes(dataSlices[i].length)}`
+          : 'site contract — points at the data contracts')
+      : `tx ${i + 1}/${calldatas.length} — ${fmtBytes(calldatas[i].length)}`
     const status = document.createElement('span')
     status.className = 'tx-status'
     li.append(label, status)
@@ -809,8 +972,73 @@ function setTxStatus(i: number, text: string, cls?: 'ok' | 'fail') {
   ;(li.querySelector('.tx-status') as HTMLElement).textContent = text
 }
 
+let deploying = false
+async function runDeploy() {
+  if (deploying) return                   // a double click must not start a second send loop
+  deploying = true
+  setDeploying(true)
+  try { await (storageMode === 'contract' ? sendContractTransactions() : sendTransactions()) }
+  finally { deploying = false; setDeploying(false) }
+}
+
+// Contract mode: a plain contract-creation tx (no `to`) per data slice, then the VerumSite contract with the
+// data contracts' addresses. Resumes at nextTxIndex after a failure; addresses already deployed are kept.
+async function sendContractTransactions() {
+  const total = dataSlices.length + 1
+  if (nextTxIndex === 0) { txList.innerHTML = ''; contractAddrs = [] }
+  for (let i = 0; i < total; i++) txListItem(i)
+
+  for (; nextTxIndex < total; nextTxIndex++) {
+    const i = nextTxIndex
+    const isSite = i === dataSlices.length
+    const init = isSite ? siteInitcode(contractAddrs) : toHex(dataContractInitcode(dataSlices[i]))
+    const gas = '0x' + (isSite
+      ? siteContractGas(getBytes(init), dataSlices.length)
+      : dataContractGas(getBytes(init), dataSlices[i].length)).toString(16)
+
+    const from = await refreshAccount()
+    if (!from) {
+      setTxStatus(i, 'wallet disconnected', 'fail')
+      showDeployError('The wallet reports no connected account — it may be locked or its permissions were revoked. ' +
+        'Reconnect and retry; the remaining transactions resume from here.')
+      walletConnect.classList.remove('hidden')
+      await showWalletPicker()
+      return
+    }
+
+    setTxStatus(i, 'approve in wallet…')
+    const sent = await walletRpc('eth_sendTransaction', [{ from, data: init, gas }])
+    if (sent.error || typeof sent.result !== 'string') {
+      setTxStatus(i, 'failed', 'fail')
+      showDeployError(sent.error ?? 'eth_sendTransaction returned no hash')
+      retryDeploy.classList.remove('hidden')
+      return
+    }
+    const txHash = sent.result as string
+    setTxStatus(i, `confirming ${txHash.slice(0, 10)}…`)
+    const receipt = await waitForReceipt(txHash)
+    if (!receipt) {
+      setTxStatus(i, 'confirmation timeout', 'fail')
+      showDeployError(`Transaction ${txHash} was not confirmed within 5 minutes. Retry resumes here once it lands.`)
+      retryDeploy.classList.remove('hidden')
+      return
+    }
+    if (receipt.status !== '0x1' || !receipt.contractAddress) {
+      setTxStatus(i, 'reverted', 'fail')
+      showDeployError(`Transaction ${txHash} reverted on-chain.`)
+      retryDeploy.classList.remove('hidden')
+      return
+    }
+    if (isSite) { siteAddress = receipt.contractAddress; deployBlock = parseInt(receipt.blockNumber, 16) }
+    else contractAddrs[i] = receipt.contractAddress
+    setTxStatus(i, `✓ ${receipt.contractAddress.slice(0, 10)}…${receipt.contractAddress.slice(-6)} · block ${parseInt(receipt.blockNumber, 16)}`, 'ok')
+  }
+
+  stepDeploy.classList.add('done')
+  startVerification()
+}
+
 async function sendTransactions(cap?: number) {
-  lockChainSelector()
 
   // Fresh deploy: probe the wallet RPC's request-size limit and re-chunk to pack as few txs
   // as it allows (probe + any oversize rejection cost no gas). On a retry (nextTxIndex > 0) we
@@ -897,7 +1125,7 @@ async function sendTransactions(cap?: number) {
   startVerification()
 }
 
-interface Receipt { blockNumber: string; transactionIndex: string; status: string }
+interface Receipt { blockNumber: string; transactionIndex: string; status: string; contractAddress?: string | null }
 
 async function waitForReceipt(txHash: string): Promise<Receipt | null> {
   const deadline = Date.now() + 5 * 60_000
@@ -917,10 +1145,9 @@ let verifySettled = false
 
 function startVerification() {
   if (!chain) return
-  deployedUrl = formatWeb3URL({
-    raw: '', chainId: chain.chainId, path: '/',
-    target: { type: 'tx', refs: coords },
-  })
+  deployedUrl = storageMode === 'contract'
+    ? formatWeb3URL({ raw: '', chainId: chain.chainId, path: '/', target: { type: 'contract', address: siteAddress } })
+    : formatWeb3URL({ raw: '', chainId: chain.chainId, path: '/', target: { type: 'tx', refs: coords } })
   stepVerify.classList.remove('hidden')
   stepVerify.scrollIntoView({ behavior: 'smooth', block: 'start' })
   verifyWhenReady()
@@ -964,7 +1191,8 @@ async function waitForHeliosHead(target: number): Promise<boolean> {
 async function verifyWhenReady() {
   retryVerify.classList.add('hidden')
   verifyDetail.classList.add('hidden')
-  const target = Math.max(...coords.map(c => c.blockNumber))
+  // Contract mode verifies the site contract's block; calldata verifies the last transaction's.
+  const target = storageMode === 'contract' ? deployBlock : Math.max(...coords.map(c => c.blockNumber))
   setVerifyStatus('', `Waiting for the light client to reach block ${target}…`, true)
 
   const caughtUp = await waitForHeliosHead(target)
@@ -1065,6 +1293,7 @@ const REGISTRY_IFACE = new Interface([
   'function resolver(bytes32 node) view returns (address)',
   'function owner(bytes32 node) view returns (address)',
 ])
+const TEXT_IFACE = new Interface(['function text(bytes32 node, string key) view returns (string)'])
 const RESOLVER_IFACE = new Interface(['function setText(bytes32 node, string key, string value)'])
 const NFT_IFACE = new Interface([
   'function ownerOf(uint256 tokenId) view returns (address)',
@@ -1119,7 +1348,8 @@ $('link-existing').addEventListener('click', (e) => {
   coordsBlock.classList.remove('hidden')
   stepName.classList.remove('hidden')
   stepName.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  if (coords.length > 0) coordsInput.value = coords.map(c => `${c.blockNumber}:${c.txIndex}`).join('+')
+  if (storageMode === 'contract' && siteAddress) coordsInput.value = siteAddress
+  else if (coords.length > 0) coordsInput.value = coords.map(c => `${c.blockNumber}:${c.txIndex}`).join('+')
 })
 
 // Accepts "w3://11155111:900:3+901:4", "900:3+901:4", "900:3 901:4", or
@@ -1139,17 +1369,17 @@ function parseCoords(input: string): Array<{ blockNumber: number; txIndex: numbe
     })
   }
 
-  // Strip a w3:// prefix and any chainId prefix — the target chain comes from
-  // settings, not from the pasted string, so a mismatched prefix is rejected.
+  // Strip a w3:// prefix and any trailing :chainId — the target chain comes from
+  // settings, not from the pasted string, so a mismatched chain id is rejected.
   let body = raw.replace(/^w3:\/\//i, '').replace(/\/.*$/, '')
-  const chainPrefix = /^(\d+):(?=\d+:\d+)/.exec(body)
-  if (chainPrefix) {
-    const id = parseInt(chainPrefix[1], 10)
+  const chainSuffix = /^(\d+:\d+(?:\+\d+:\d+)*):(\d+)$/.exec(body)
+  if (chainSuffix) {
+    const id = parseInt(chainSuffix[2], 10)
     if (chain && id !== chain.chainId) {
       throw new Error(`Those coordinates are for chainId ${id}, but the deploy page targets ` +
         `${chain.name} (chainId ${chain.chainId}). Change the network in settings first.`)
     }
-    body = body.slice(chainPrefix[0].length)
+    body = chainSuffix[1]
   }
 
   const parts = body.split(/[+\s,]+/).filter(Boolean)
@@ -1160,18 +1390,36 @@ function parseCoords(input: string): Array<{ blockNumber: number; txIndex: numbe
   })
 }
 
+// A contract address typed into the standalone box ("0x…", optionally with :chainId or a w3:// prefix).
+// Returns null when the input is not an address (then it is parsed as coordinates).
+function parseContractInput(input: string): string | null {
+  const m = /^(0x[0-9a-fA-F]{40})(?::(\d+))?$/.exec(input.trim().replace(/^w3:\/\//i, '').replace(/\/.*$/, ''))
+  if (!m) return null
+  if (m[2] && chain && parseInt(m[2], 10) !== chain.chainId) {
+    throw new Error(`That contract is on chainId ${m[2]}, but the deploy page targets ${chain.name} ` +
+      `(chainId ${chain.chainId}). Change the network in settings first.`)
+  }
+  return m[1]
+}
+
 linkNameBtn.addEventListener('click', async () => {
-  // Standalone mode: coordinates come from the input rather than a deployment.
+  // A contract deployment is linked through the ERC-6821 `contentcontract` record; coordinates use `w3`.
+  let linkAddress = ''
   if (!coordsBlock.classList.contains('hidden')) {
+    // Standalone mode: the deployment comes from the input (a contract address or coordinates).
     try {
-      coords = parseCoords(coordsInput.value)
+      linkAddress = parseContractInput(coordsInput.value) ?? ''
+      if (!linkAddress) coords = parseCoords(coordsInput.value)
     } catch (err: any) {
       setNameStatus('fail', err?.message ?? String(err))
       return
     }
+  } else if (storageMode === 'contract' && siteAddress) {
+    linkAddress = siteAddress
   }
-  if (coords.length === 0) {
-    setNameStatus('fail', 'No deployment coordinates — deploy first, or enter existing ones above.')
+  const contractLink = !!linkAddress
+  if (!contractLink && coords.length === 0) {
+    setNameStatus('fail', 'No deployment — deploy first, or enter a contract address or coordinates above.')
     return
   }
   if (!account) {
@@ -1206,12 +1454,18 @@ linkNameBtn.addEventListener('click', async () => {
 
   linkNameBtn.disabled = true
   try {
-    const value = JSON.stringify(coords.map(c => [c.blockNumber, c.txIndex]))
+    const recordKey = contractLink ? 'contentcontract' : 'w3'
+    // ERC-6821: a plain address is read on the chain the name is resolved on. The name is linked on the
+    // chain the contract was deployed to, so no chain prefix is needed (and Verum rejects a different one).
+    const value = contractLink
+      ? linkAddress
+      : JSON.stringify(coords.map(c => [c.blockNumber, c.txIndex]))
     const node = namehash(name)
     const isGns = name.endsWith('.gwei')
     const isWns = name.endsWith('.wei')
     let to: string
     let data: string
+    let encodeSet: (key: string, v: string) => string
 
     if (isWns) {
       if (chain?.chainId !== 1) {
@@ -1235,7 +1489,8 @@ linkNameBtn.addEventListener('click', async () => {
         throw new Error(`"${name}" is expired — renew it at wei.domains first.`)
       }
       to = WNS_NFT
-      data = NFT_IFACE.encodeFunctionData('setText', [tokenId, 'w3', value])
+      encodeSet = (k, v) => NFT_IFACE.encodeFunctionData('setText', [tokenId, k, v])
+      data = encodeSet(recordKey, value)
     } else if (isGns) {
       setNameStatus('', `Checking ownership of ${name}…`, true)
       const tokenId = BigInt(node)
@@ -1255,7 +1510,8 @@ linkNameBtn.addEventListener('click', async () => {
         throw new Error(`"${name}" is expired — renew it at gwei.domains first.`)
       }
       to = GNS_NFT
-      data = NFT_IFACE.encodeFunctionData('setText', [tokenId, 'w3', value])
+      encodeSet = (k, v) => NFT_IFACE.encodeFunctionData('setText', [tokenId, k, v])
+      data = encodeSet(recordKey, value)
     } else {
       setNameStatus('', `Looking up resolver for ${name}…`, true)
       const resolverRes = await ethCall(ENS_REGISTRY, REGISTRY_IFACE.encodeFunctionData('resolver', [node]))
@@ -1271,12 +1527,13 @@ linkNameBtn.addEventListener('click', async () => {
         setNameStatus('', `Registry owner is ${owner} (wrapped name?) — the wallet will reject if unauthorised…`, true)
       }
       to = resolver
-      data = RESOLVER_IFACE.encodeFunctionData('setText', [node, 'w3', value])
+      encodeSet = (k, v) => RESOLVER_IFACE.encodeFunctionData('setText', [node, k, v])
+      data = encodeSet(recordKey, value)
     }
 
     const gas = await gasForRecordTx(signer, to, data)
 
-    setNameStatus('', `Setting "w3" record = ${value} — approve in wallet…`, true)
+    setNameStatus('', `Setting "${recordKey}" record = ${value} — approve in wallet…`, true)
     const sent = await walletRpc('eth_sendTransaction', [{ from: signer, to, data, gas }])
     if (sent.error || typeof sent.result !== 'string') {
       throw new Error(sent.error ?? 'eth_sendTransaction returned no hash')
@@ -1286,15 +1543,33 @@ linkNameBtn.addEventListener('click', async () => {
     if (!receipt) throw new Error('Record transaction not confirmed within 5 minutes.')
     if (receipt.status !== '0x1') throw new Error('Record transaction reverted — is the connected account authorised for this name?')
 
+    // A name should point at exactly one deployment: the new one replaces whatever content record it had.
+    // The resolver prefers `w3` over `contentcontract`, so a stale `w3` would also keep serving the old page.
+    // Clear the other record with a second write when it is set.
+    const otherKey = contractLink ? 'w3' : 'contentcontract'
+    const stale = await ethCall(to, TEXT_IFACE.encodeFunctionData('text', [node, otherKey]))
+      .then(r => TEXT_IFACE.decodeFunctionResult('text', r)[0] as string).catch(() => '')
+    if (stale) {
+      const clearData = encodeSet(otherKey, '')
+      const clearGas = await gasForRecordTx(signer, to, clearData)
+      setNameStatus('', `${name} already has a "${otherKey}" record (${stale.length > 40 ? stale.slice(0, 40) + '…' : stale}) — replacing it, approve in wallet…`, true)
+      const cleared = await walletRpc('eth_sendTransaction', [{ from: signer, to, data: clearData, gas: clearGas }])
+      if (cleared.error || typeof cleared.result !== 'string') throw new Error(cleared.error ?? 'eth_sendTransaction returned no hash')
+      const clearReceipt = await waitForReceipt(cleared.result as string)
+      if (!clearReceipt || clearReceipt.status !== '0x1') {
+        throw new Error(`The "${recordKey}" record was set, but clearing the older "${otherKey}" record failed — the name may keep showing the old page until it is cleared.`)
+      }
+    }
+
     const nameUrl = formatWeb3URL({
       raw: '', chainId: chain!.chainId, path: '/', target: { type: 'ens', name },
     })
     setNameStatus('ok', `✓ Record set in block ${parseInt(receipt.blockNumber, 16)}.`)
     nameDone.classList.remove('hidden')
-    // Standalone linking has no deploy step, so derive the coordinate URL from
-    // whatever coords we linked (typed in or produced by this session's deploy).
-    $('name-coords-url').textContent = deployedUrl || formatWeb3URL({
-      raw: '', chainId: chain!.chainId, path: '/', target: { type: 'tx', refs: coords },
+    // Show the URL of what was linked (typed in, or produced by this session's deploy).
+    $('name-coords-url').textContent = formatWeb3URL({
+      raw: '', chainId: chain!.chainId, path: '/',
+      target: contractLink ? { type: 'contract', address: linkAddress } : { type: 'tx', refs: coords },
     })
     nameLink.href = chrome.runtime.getURL('renderer.html') + '#' + nameUrl
     nameLink.textContent = `Open ${nameUrl}`

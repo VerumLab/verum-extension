@@ -61,7 +61,7 @@ const _fr = JSON.stringify(fragment)     // #… state to restore, safely embedd
 const _pd = prefersDark ? 'true' : 'false'
 return '<scr' + 'ipt>(function(){' +
   // matchMedia shim: a freshly-created srcdoc iframe can evaluate prefers-color-scheme to
-  // the wrong value at parse time, so websites reading it synchronously at init (zSwap) render
+  // the wrong value at parse time, so websites reading it synchronously at init render
   // light at random. Return the renderer's reliably-detected OS scheme for color-scheme
   // queries; delegate every other query (pointer:coarse, resize, …) to the native impl.
   'try{var _mm=window.matchMedia?window.matchMedia.bind(window):null;var _pd=' + _pd + ';' +
@@ -174,10 +174,11 @@ return '<scr' + 'ipt>(function(){' +
     '});' +
   '}' +
   'var _eth={' +
-    'isMetaMask:true,chainId:"' + chainIdHex + '",isConnected:function(){return true;},' +
+    'isMetaMask:true,isVerum:true,chainId:"' + chainIdHex + '",isConnected:function(){return true;},' +
     '_handlers:{},' +
     'request:function(a){' +
-      'if(a.method==="eth_chainId")return Promise.resolve("' + chainIdHex + '");' +
+      // eth_chainId is answered by the host (renderer) so it reflects the ACTIVE chain, which a
+      // wallet_switchEthereumChain can change at runtime (EIP-3326); chainId below is only the initial value.
       'return _send(a.method,a.params,null);' +
     '},' +
     'enable:function(){return this.request({method:"eth_requestAccounts",params:[]});},' +
@@ -243,7 +244,7 @@ return '<scr' + 'ipt>(function(){' +
     'if(e.data.type==="eth-response"){' +
       'var cb=_cbs[e.data.id];if(!cb)return;' +
       'delete _cbs[e.data.id];' +
-      'if(e.data.error)cb.rej(new Error(e.data.error));else cb.res(e.data.result);' +
+      'if(e.data.error){var er=new Error(e.data.error);if(e.data.errorCode!=null)er.code=e.data.errorCode;cb.rej(er);}else cb.res(e.data.result);' +
       'return;' +
     '}' +
     'if(e.data.type==="wallet-event"){' +
@@ -251,14 +252,23 @@ return '<scr' + 'ipt>(function(){' +
         'window.dispatchEvent(new Event("focus"));return;' +
       '}' +
       'var p=e.data.params;' +
+      // chainChanged (EIP-1193) carries the new chain id as a hex string. chainSync updates the
+      // provider's chainId without an event: the host sends it when a page (re)loads on a chain other than
+      // its URL's, so a reload can't make the page believe it is back on the original one.
+      'if(e.data.method==="chainChanged"||e.data.method==="chainSync"){' +
+        'var c=Array.isArray(p)?p[0]:p;if(typeof c!=="string")return;' +
+        'window.ethereum.chainId=c;' +
+        'if(e.data.method==="chainChanged")window.ethereum.emit("chainChanged",c);' +
+        'return;' +
+      '}' +
       'var d=(Array.isArray(p)&&Array.isArray(p[0]))?p[0]:p;' +
       'window.ethereum.emit(e.data.method,d);' +
     '}' +
   '});' +
   // Gateway → w3:// converter. Routes a link back through verum (verified) instead of an
   // external HTTP gateway. Returns null for a normal link (opened externally). Two cases:
-  //  1. A web3 NAME in the host (.eth/.wei/.gwei) — always ours, whether bare (zswap.wei),
-  //     via .limo/.link (zswap.wei.limo), or via an ERC-4804 gateway (foo.eth.w3link.io).
+  //  1. A web3 NAME in the host (.eth/.wei/.gwei) — always ours, whether bare (example.wei),
+  //     via .limo/.link (example.wei.limo), or via an ERC-4804 gateway (foo.eth.w3link.io).
   //  2. A raw contract ADDRESS that is the SUBDOMAIN of a dedicated ERC-4804 gateway
   //     (0xADDR[.<chain>].w4eth.io). The address must be the host label — an address in a
   //     PATH (etherscan.com/address/0x…) is NOT a gateway and is left alone.

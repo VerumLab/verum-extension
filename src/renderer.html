@@ -87,10 +87,17 @@
     </div>
   </div>
 
+  <!-- Bottom-left status row: verify badge, with the network chip beside it -->
+  <div id="status-row">
   <!-- Verifying badge — shown until Helios confirms or denies -->
   <div id="verify-badge" class="hidden">
     <span id="verify-icon">⟳</span>
     <span id="verify-label">Verifying…</span>
+  </div>
+
+  <!-- Network chip — shown while the website runs on a different chain than the one it was loaded and
+       verified from (it switched network at runtime). Hidden again on the next navigation. -->
+  <div id="chain-chip" class="hidden"></div>
   </div>
 
   <!-- Helios RPC init badge — shown while Helios execution sync is pending -->
@@ -98,7 +105,6 @@
     <span id="helios-badge-icon">⟳</span>
     <span>Updating Helios RPC…</span>
   </div>
-
 
 
   <script type="module" src="./renderer.ts"></script>

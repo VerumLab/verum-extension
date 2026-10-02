@@ -11,6 +11,15 @@
   --red: #f85149;
   --yellow: #d29922;
   --radius: 8px;
+  --pill-bg: rgba(22,27,34,0.92);
+  --pill-border: var(--border); --pill-muted: var(--text-muted); --pill-green: var(--green); --pill-yellow: var(--yellow);
+}
+/* The status pills sit over the website, so they follow the OS color scheme like the page does. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --pill-bg: rgba(255,255,255,0.94);
+    --pill-border: #d0d7de; --pill-muted: #57606a; --pill-green: #1a7f37; --pill-yellow: #9a6700;
+  }
 }
 
 html, body {
@@ -74,19 +83,22 @@ html, body {
 #rocket-game .rg-restart:disabled { opacity: 0.4; cursor: default; }
 
 /* ---- Verifying badge — bottom-left, disappears once verified ---- */
-#verify-badge {
+#status-row {
   position: fixed; bottom: 14px; left: 14px; z-index: 1000;
+  display: flex; align-items: center; gap: 8px;
+}
+#verify-badge {
   display: flex; align-items: center; gap: 6px;
-  background: rgba(22,27,34,0.92); backdrop-filter: blur(8px);
-  border: 1px solid var(--border); border-radius: 20px;
-  padding: 5px 14px; font-size: 12px; color: var(--text-muted);
+  background: var(--pill-bg); backdrop-filter: blur(8px);
+  border: 1px solid var(--pill-border); border-radius: 20px;
+  padding: 5px 14px; font-size: 12px; color: var(--pill-muted);
   pointer-events: none;
 }
-#verify-badge.syncing  { border-color: var(--text-muted); }
-#verify-badge.portal   { border-color: var(--green);  color: var(--green); }
-#verify-badge.verified { border-color: var(--green);  color: var(--green); }
-#verify-badge.beacon   { border-color: var(--green);  color: var(--green); }
-#verify-badge.failed   { border-color: var(--yellow); color: var(--yellow); }
+#verify-badge.syncing  { border-color: var(--pill-muted); }
+#verify-badge.portal   { border-color: var(--pill-green);  color: var(--pill-green); }
+#verify-badge.verified { border-color: var(--pill-green);  color: var(--pill-green); }
+#verify-badge.beacon   { border-color: var(--pill-green);  color: var(--pill-green); }
+#verify-badge.failed   { border-color: var(--pill-yellow); color: var(--pill-yellow); }
 #verify-icon { font-size: 14px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 #verify-badge.syncing #verify-icon { display: inline-block; animation: spin 1s linear infinite; }
@@ -95,12 +107,29 @@ html, body {
 #helios-badge {
   position: fixed; bottom: 14px; right: 14px; z-index: 1000;
   display: flex; align-items: center; gap: 6px;
-  background: rgba(22,27,34,0.92); backdrop-filter: blur(8px);
-  border: 1px solid var(--border); border-radius: 20px;
-  padding: 5px 14px; font-size: 12px; color: var(--text-muted);
+  background: var(--pill-bg); backdrop-filter: blur(8px);
+  border: 1px solid var(--pill-border); border-radius: 20px;
+  padding: 5px 14px; font-size: 12px; color: var(--pill-muted);
   pointer-events: none;
 }
 #helios-badge-icon { font-size: 14px; display: inline-block; animation: spin 1s linear infinite; }
+
+/* ---- Network chip — always shown for a dapp, styled like the other pills. Drag it to any corner;
+   bottom-left it joins the status row beside the verify badge, elsewhere it is fixed in that corner. ---- */
+#chain-chip {
+  background: var(--pill-bg); backdrop-filter: blur(8px);
+  border: 1px solid var(--pill-border); border-radius: 20px;
+  padding: 5px 14px; font-size: 12px; color: var(--pill-muted);
+  cursor: pointer; touch-action: none; user-select: none;
+}
+#chain-chip .chip-info { display: none; margin-top: 4px; max-width: 260px; font-size: 11px; line-height: 1.4; white-space: normal; }
+#chain-chip.open .chip-info { display: block; }
+#chain-chip.open { border-radius: 12px; }
+#chain-chip.dragging { cursor: grabbing; }
+#chain-chip.corner-tl, #chain-chip.corner-tr, #chain-chip.corner-br { position: fixed; z-index: 1000; }
+#chain-chip.corner-tl { top: 14px; left: 14px; }
+#chain-chip.corner-tr { top: 14px; right: 14px; }
+#chain-chip.corner-br { bottom: 14px; right: 14px; }
 
 /* ---- Unverified warning banner ---- */
 #warning-banner {
