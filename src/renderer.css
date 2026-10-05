@@ -124,6 +124,13 @@ html, body {
 }
 #chain-chip .chip-info { display: none; margin-top: 4px; max-width: 260px; font-size: 11px; line-height: 1.4; white-space: normal; }
 #chain-chip.open .chip-info { display: block; }
+#chain-chip .chip-actions { display: none; flex-wrap: wrap; align-items: center; margin-top: 6px; gap: 6px; }
+#chain-chip.open .chip-actions { display: flex; }
+#chain-chip .chip-actions button {
+  font: inherit; font-size: 11px; cursor: pointer; color: inherit;
+  background: transparent; border: 1px solid var(--pill-border); border-radius: 10px; padding: 2px 8px;
+}
+#chain-chip .chip-actions button:hover { border-color: var(--pill-muted); }
 #chain-chip.open { border-radius: 12px; }
 #chain-chip.dragging { cursor: grabbing; }
 #chain-chip.corner-tl, #chain-chip.corner-tr, #chain-chip.corner-br { position: fixed; z-index: 1000; }

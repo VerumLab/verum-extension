@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Verum",
   "short_name": "verum",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Browse websites and data stored on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",
@@ -62,7 +62,7 @@
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
-    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; script-src 'self' 'unsafe-inline' data: blob:; style-src 'self' 'unsafe-inline'; img-src * data: blob:; default-src 'self' blob: data:"
+    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' data: blob:; style-src 'self' 'unsafe-inline'; img-src * data: blob:; default-src 'self' blob: data:"
   },
   "sandbox": {
     "pages": ["website-sandbox.html"]

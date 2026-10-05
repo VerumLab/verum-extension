@@ -227,6 +227,7 @@ export interface VerificationUpdate {
   beaconEraVerified?: boolean       // historical_summaries era cross-check passed
   beaconStateHashVerified?: boolean // full hash_tree_root(BeaconState) computed locally
   ensVerified?: boolean | null      // true = confirmed; false = mismatch (possible forgery); null/undefined = unverified
+  heliosError?: string              // Helios could not be loaded or synced, so verification did not run (an error, not a mismatch)
   proof: {
     url: string
     blockNumber: number

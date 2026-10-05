@@ -874,6 +874,8 @@ async function twoPhaseResolve(
   let update: VerificationUpdate
   // Hoist so the EIP-2935 fallback can pass heliosRpc as an EIP-4788 anchor
   let heliosRpc: Awaited<ReturnType<typeof getOrCreateRpc>> | undefined
+  // Set when Helios itself could not be loaded/synced; reported as an error, never as "name not confirmed".
+  let heliosFailure: string | undefined
 
   try {
     // Keep the rejection reason — swallowing it left "Helios not available" as
@@ -929,6 +931,7 @@ async function twoPhaseResolve(
     }
   } catch (err) {
     console.warn('[w3] Mode 1 — Recent block, Helios-verified: failed —', (err as Error).message)
+    if (!heliosRpc) heliosFailure = (err as Error).message
 
     if (isEip2935Error(err) && chain.consensusRpcs.length > 0) {
       w3log('[w3] Mode 1 failed (EIP-2935, block outside Helios\'s ring) — falling back to Mode 2 — Historical block, beacon-verified')
@@ -979,6 +982,7 @@ async function twoPhaseResolve(
           beaconEraVerified: beacon.eraVerified,
           beaconStateHashVerified: beacon.stateHashVerified,
           ensVerified,
+          heliosError: heliosFailure,
           proof: {
             url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
             txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
@@ -996,6 +1000,7 @@ async function twoPhaseResolve(
           type: 'verification-update',
           heliosBacked: false, trieVerified: false,
           ensVerified,
+          heliosError: heliosFailure,
           proof: {
             url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
             txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
@@ -1009,6 +1014,7 @@ async function twoPhaseResolve(
         type: 'verification-update',
         heliosBacked: false, trieVerified: false,
         ensVerified,
+        heliosError: heliosFailure,
         proof: {
           url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
           txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
@@ -1147,7 +1153,11 @@ async function resolveContractServed(
       // state change) it may not see the contract / the new state yet. Both resolve by waiting a little,
       // so retry those a few times before treating them as unverified / a mismatch.
       let behindRetries = 0
-      for (let attempt = 0; attempt < 8; attempt++) {
+      // A Helios instance that cannot sync (head frozen, lag growing) is restarted by the OOS watchdog once it is
+      // ~150s behind, and the fresh one then needs a little while to come up. Wait that out by time, not by a
+      // fixed number of tries: giving up earlier reported "unverified" a few seconds before recovery began.
+      const heliosDeadline = Date.now() + 180_000
+      for (let attempt = 0; Date.now() < heliosDeadline; attempt++) {
         const heliosRpc = await Promise.race([
           getOrCreateRpc(chain),
           new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
@@ -1170,7 +1180,7 @@ async function resolveContractServed(
           if (!transient && !(notYetVisible && behindRetries < 6)) throw e
           if (notYetVisible) behindRetries++
           console.warn(`[w3] Contract-served — Helios ${transient ? 'instance restarted' : 'head behind the deployment'} (attempt ${attempt + 1}) — retrying`)
-          await new Promise(r => setTimeout(r, transient ? 1500 : 5000))
+          await new Promise(r => setTimeout(r, !transient ? 5000 : m.includes('out of sync') ? 3000 : 1500))
         }
       }
       if (!verified) throw lastErr ?? new Error('Helios verification failed')
@@ -1188,7 +1198,7 @@ async function resolveContractServed(
     // that returns different bytes is a mismatch (verified:false above).
     console.warn('[w3] Contract-served — verification unavailable —', (err as Error).message)
     update = contractUpdate(rawUrl, address, content, blockNumber, blockHash,
-      { heliosBacked: false, trieVerified: false, verified: undefined })
+      { heliosBacked: false, trieVerified: false, verified: undefined, heliosError: (err as Error).message })
   }
 
   if (isSuperseded()) { port.disconnect(); return }
@@ -1203,10 +1213,11 @@ function contractUpdate(
   content: ContractContent,
   blockNumber: number,
   blockHash: string,
-  flags: { heliosBacked: boolean; trieVerified: boolean; verified: boolean | undefined; localMode?: boolean },
+  flags: { heliosBacked: boolean; trieVerified: boolean; verified: boolean | undefined; localMode?: boolean; heliosError?: string },
 ): VerificationUpdate {
   return {
     type: 'verification-update',
+    heliosError: flags.heliosError,
     heliosBacked: flags.heliosBacked,
     trieVerified: flags.trieVerified,
     localMode: flags.localMode,
@@ -1271,6 +1282,7 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
       beaconEraVerified: update.beaconEraVerified ?? false,
       beaconStateHashVerified: update.beaconStateHashVerified ?? false,
       ensVerified: update.ensVerified ?? null,
+      heliosError: update.heliosError ?? null,
       pending: false,
       ...update.proof,
     },

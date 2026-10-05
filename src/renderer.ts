@@ -367,6 +367,12 @@ function placeChip(corner: Corner) {
 chrome.storage.local.get('chainChipCorner').then(({ chainChipCorner }) => {
   if (['tl', 'tr', 'bl', 'br'].includes(chainChipCorner as string)) placeChip(chainChipCorner as Corner)
 }).catch(() => {})
+// A press anywhere outside the pill closes it. A press inside the website's frame never reaches this page,
+// but it moves focus to the frame, which the window blur below catches.
+document.addEventListener('pointerdown', (e) => { if (!chainChip.contains(e.target as Node)) chainChip.classList.remove('open') })
+window.addEventListener('blur', () => {
+  setTimeout(() => { if (document.activeElement === websiteFrame) chainChip.classList.remove('open') }, 0)
+})
 chainChip.addEventListener('pointerdown', (down) => {
   const box = chainChip.getBoundingClientRect()
   const dx = down.clientX - box.left, dy = down.clientY - box.top
@@ -399,6 +405,7 @@ chainChip.addEventListener('pointerdown', (down) => {
 })
 
 // Chains Verum is configured for (settings, else the defaults) — the only ones a page may switch to.
+let connectedAccount = ''   // the connected wallet's first account, shown on the pill (cleared whenever the wallet is dropped)
 const chainNames = new Map<number, string>()
 // Seed with the defaults so the chip never shows a bare id before the stored settings have loaded.
 for (const [k, c] of Object.entries(DEFAULT_CHAINS)) chainNames.set(Number(k), (c as { name?: string }).name ?? `chain ${k}`)
@@ -426,15 +433,56 @@ function updateChainChip() {
   if (!chipVisible || !dappSeen) { chainChip.classList.add('hidden'); return }
   const name = chainNames.get(activeChainId) ?? `chain ${activeChainId}`
   const switched = activeChainId !== currentChainId
-  // The pill shows just the network; click it for the explanation.
-  const nameEl = document.createElement('span'); nameEl.textContent = name
+  // The pill shows the network (and the connected account); click it for the explanation and, when a wallet is connected, its actions.
+  const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
+  const connected = !!selectedWalletId && !!connectedAccount
+  const nameEl = document.createElement('span'); nameEl.textContent = connected ? `${name} · ${short(connectedAccount)}` : name
   const infoEl = document.createElement('span'); infoEl.className = 'chip-info'
   infoEl.textContent = (switched
     ? `This website switched to ${name}. It was loaded and verified from ${chainNames.get(currentChainId) ?? `chain ${currentChainId}`}; ` +
       `its reads and transactions now use ${name}.`
-    : `This website's reads and transactions use ${name}.`) + ' Drag the pill to move it to another corner.'
-  chainChip.replaceChildren(nameEl, infoEl)
+    : `This website's reads and transactions use ${name}.`)
+  const kids: HTMLElement[] = [nameEl, infoEl]
+  const actions = document.createElement('span'); actions.className = 'chip-actions'
+  // A press on a control inside the pill is not a drag/click of the pill itself.
+  const inert = (el: HTMLElement) => el.addEventListener('pointerdown', (e) => e.stopPropagation())
+
+  if (connected) {
+    // MetaMask shows no connect/switch UI for an extension page, and a website's own "disconnect" often
+    // only clears its screen, so the wallet stays connected. These two actions work for any website.
+    for (const [label, run] of [['Switch account', switchAccount], ['Disconnect', disconnectAccount]] as const) {
+      const btn = document.createElement('button'); btn.textContent = label
+      inert(btn)
+      btn.addEventListener('click', () => { void run() })
+      actions.appendChild(btn)
+    }
+  }
+  kids.push(actions)
+  chainChip.replaceChildren(...kids)
   chainChip.classList.remove('hidden')
+}
+
+// Pill actions. Switch account re-asks the wallet for permission, which opens its account picker even though
+// this site is already connected; Disconnect revokes the grant and tells the website.
+async function switchAccount() {
+  if (!selectedWalletId) return
+  const r = await walletCall('wallet_requestPermissions', [{ eth_accounts: {} }])
+  if (r.error) return                                   // cancelled in the wallet
+  const a = await walletCall('eth_accounts', [])
+  const accounts = Array.isArray(a.result) ? a.result as string[] : []
+  connectedAccount = accounts[0] ?? ''
+  updateChainChip()
+  websiteFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'accountsChanged', params: accounts }, '*')
+}
+
+async function disconnectAccount() {
+  if (!selectedWalletId) return
+  await walletCall('wallet_revokePermissions', [{ eth_accounts: {} }])
+  selectedWalletId = null
+  connectedAccount = ''
+  selectedWalletName = 'wallet'
+  updateChainChip()
+  websiteFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'accountsChanged', params: [] }, '*')
 }
 
 // wallet_switchEthereumChain / wallet_addEthereumChain from the page: change the provider's active chain.
@@ -478,6 +526,9 @@ window.addEventListener('message', async (e) => {
   if (!e.data) return
   if (e.source !== websiteFrame.contentWindow) return
 
+  // A press inside the website closes the pill's menu.
+  if (e.data.type === 'page-press') { chainChip.classList.remove('open'); return }
+
   if (e.data.type === 'w3-navigate' && typeof e.data.url === 'string') {
     // Remember the gateway fallback for this navigation: if the target turns out to be an
     // IPFS site verum can't serve, we open this instead of showing an error.
@@ -517,7 +568,9 @@ window.addEventListener('message', async (e) => {
   // immediately so subsequent eth_accounts checks return [] and wagmi doesn't reconnect.
   if (e.data.type === 'eth-disconnect') {
     selectedWalletId = null
+    connectedAccount = ''
     selectedWalletName = 'wallet'
+    updateChainChip()
     websiteFrame.contentWindow?.postMessage(
       { type: 'wallet-event', method: 'accountsChanged', params: [] },
       '*',
@@ -693,7 +746,9 @@ window.addEventListener('message', async (e) => {
 
   if (resp?.error && (resp.error === 'Wallet disconnected' || CONNECT_METHODS.has(method))) {
     selectedWalletId = null
+    connectedAccount = ''
     selectedWalletName = 'wallet'
+    updateChainChip()
     if (CONNECT_METHODS.has(method) && resp.error !== 'Wallet disconnected') {
       connectSuppressedUntil = Date.now() + 1000
     }
@@ -702,11 +757,21 @@ window.addEventListener('message', async (e) => {
   // wallet_revokePermissions = disconnect. Clear wallet state and notify the website.
   if (!resp?.error && method === 'wallet_revokePermissions') {
     selectedWalletId = null
+    connectedAccount = ''
     selectedWalletName = 'wallet'
+    updateChainChip()
     websiteFrame.contentWindow?.postMessage(
       { type: 'wallet-event', method: 'accountsChanged', params: [] },
       '*',
     )
+  }
+
+  // Remember the connected account for the pill.
+  if (!resp?.error && selectedWalletId) {
+    if ((method === 'eth_requestAccounts' || method === 'eth_accounts') && Array.isArray(resp?.result)) {
+      connectedAccount = (resp.result as string[])[0] ?? ''
+      updateChainChip()
+    }
   }
 
   // EIP-1193: emit accountsChanged so websites that rely on the event update their UI.
@@ -724,6 +789,8 @@ window.addEventListener('message', async (e) => {
     const ethPerm = perms.find(p => p.parentCapability === 'eth_accounts')
     const accounts = ethPerm?.caveats?.find(c => c.type === 'restrictReturnedAccounts')?.value
     if (Array.isArray(accounts) && accounts.length > 0) {
+      connectedAccount = String(accounts[0])
+      updateChainChip()
       websiteFrame.contentWindow?.postMessage(
         { type: 'wallet-event', method: 'accountsChanged', params: accounts },
         '*',
@@ -833,6 +900,8 @@ async function navigate(web3Url: string, attempt = 0) {
   rawView.classList.remove('raw-visible')
 
   selectedWalletId = null
+
+  connectedAccount = ''
   selectedWalletName = 'wallet'
   connectInProgress = false
   connectSuppressedUntil = 0
@@ -962,14 +1031,22 @@ function applyVerification(msg: VerificationUpdate) {
   }
   currentLocalMode = false
 
+  // Helios failing to load or sync is an ERROR in its own right: nothing was checked, so it must not read as
+  // "name not confirmed" (which implies a check that came back inconclusive).
+  const heliosErrorText = (why: string) => `Helios failed to load: ${why}. The content could not be verified.`
+
   if (isEnsTarget && msg.ensVerified !== true) {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
     verifyLabel.textContent = msg.ensVerified === false
       ? 'Name forged — record differs from Helios'
+      : msg.heliosError ? 'Helios error — could not verify'
       : 'Unverified — Name not confirmed by Helios'
     if (msg.ensVerified === false) {
       warningText.textContent = 'Name record mismatch — the RPC returned a different record than Helios confirmed. This may indicate a compromised RPC endpoint.'
+      showWarning()
+    } else if (msg.heliosError) {
+      warningText.textContent = heliosErrorText(msg.heliosError)
       showWarning()
     }
     return
@@ -986,8 +1063,10 @@ function applyVerification(msg: VerificationUpdate) {
   } else {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
-    verifyLabel.textContent = 'Unverified — RPC trusted without proof'
-    warningText.textContent = 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'
+    verifyLabel.textContent = msg.heliosError ? 'Helios error — could not verify' : 'Unverified — RPC trusted without proof'
+    warningText.textContent = msg.heliosError
+      ? heliosErrorText(msg.heliosError)
+      : 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'
     showWarning()
     const contentLabel = renderMode === 'raw' ? 'file' : 'website'
     unverifiedModalMsg.textContent = `This ${contentLabel} could not be verified against the blockchain. Its content may have been tampered with. Continue at your own risk.`

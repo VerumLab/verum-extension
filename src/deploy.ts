@@ -93,6 +93,14 @@ const previewActiveChain = () => previewChainId ?? chain?.chainId ?? 1
 let previewShowsWebsite = false   // the preview is rendering a website (not the raw view)
 let previewDappSeen = false       // ...and it has made a provider/RPC request, i.e. it is a dapp
 document.getElementById('preview-chain-note')?.addEventListener('click', (e) => (e.currentTarget as HTMLElement).classList.toggle('open'))
+// A press anywhere else on the page, or inside the previewed website, closes the note.
+document.addEventListener('pointerdown', (e) => {
+  const n = document.getElementById('preview-chain-note')
+  if (n && !n.contains(e.target as Node)) n.classList.remove('open')
+})
+window.addEventListener('message', (e) => {
+  if (e.source === previewFrame.contentWindow && e.data?.type === 'page-press') document.getElementById('preview-chain-note')?.classList.remove('open')
+})
 function updatePreviewChainNote() {
   const note = document.getElementById('preview-chain-note')
   if (!note) return

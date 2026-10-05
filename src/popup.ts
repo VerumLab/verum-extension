@@ -88,6 +88,8 @@ function showProof(d: any) {
   // calldata or a content-serving contract. Block:txIndex and raw contract refs
   // have no dots.
   const isEns = typeof d.url === 'string' && /(?:w3|portal):\/\/(?:\d+:)?[^/:]*\.[^/:]+/.test(d.url)
+  // Helios failed to load/sync: reported as an error, not as an inconclusive check.
+  const heliosErr = typeof d.heliosError === 'string' && d.heliosError !== ''
   const ensBlocked = isEns && d.ensVerified !== true && !pending && !d.localMode
   const contractBlocked = contractServed && d.ensVerified !== true && !pending && !d.localMode
   const cls = d.localMode ? 'verified' : ensBlocked || contractBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
@@ -102,6 +104,7 @@ function showProof(d: any) {
     fullyVerified ? '✓' : pending ? '⟳' : '⚠️'
   document.getElementById('verdict-text')!.textContent =
     d.localMode       ? 'Local node — RPC trusted' :
+    heliosErr && (contractBlocked || ensBlocked) ? 'Helios error — could not load, nothing was verified' :
     contractBlocked && d.ensVerified === false ? 'Content differs from Helios — possible forgery' :
     contractBlocked   ? 'Unverified — Helios could not confirm content' :
     ensBlocked && d.ensVerified === false ? 'Name forged — record differs from Helios' :
@@ -111,6 +114,7 @@ function showProof(d: any) {
     beaconTrusted     ? 'Verified by Helios' :
     d.beaconVerified  ? 'Untrusted — beacon proof without Helios anchor' :
     pending           ? 'Verifying…' :
+    heliosErr         ? 'Helios error — could not load, nothing was verified' :
     'Unverified — RPC trusted without proof'
 
   const set = (id: string, val: string) => {
@@ -181,6 +185,7 @@ function showProof(d: any) {
       d.ensVerified === true  ? 'YES — confirmed by Helios' :
       d.ensVerified === false ? 'MISMATCH — differs from Helios (possible forgery)' :
       pending                 ? 'Verifying…' :
+      heliosErr               ? `Helios error — ${String(d.heliosError).slice(0, 120)}` :
                                 'Unverified — Helios could not confirm',
     )
   }

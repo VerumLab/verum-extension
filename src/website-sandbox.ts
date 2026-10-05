@@ -15,7 +15,7 @@ type RenderMessage = {
 }
 
 type BridgeMessage = {
-  type: 'eth-request' | 'eth-response' | 'w3-navigate' | 'polyfill-ready' | 'wallet-event'
+  type: 'eth-request' | 'eth-response' | 'w3-navigate' | 'polyfill-ready' | 'wallet-event' | 'page-press'
   [key: string]: unknown
 }
 
@@ -36,6 +36,12 @@ window.addEventListener('message', (event: MessageEvent<BridgeMessage | RenderMe
 
   if (event.data.type === 'polyfill-ready' && event.source === frame.contentWindow) {
     window.parent.postMessage({ type: 'polyfill-ready' }, '*')
+  }
+
+  // A press inside the website: the host's pills close their menus on it (a press in this frame never
+  // reaches the host page itself).
+  if (event.data.type === 'page-press' && event.source === frame.contentWindow) {
+    window.parent.postMessage({ type: 'page-press' }, '*')
   }
 
   if (event.data.type === 'eth-response' && event.source === window.parent) {
@@ -98,6 +104,30 @@ return '<scr' + 'ipt>(function(){' +
     '})}' +
   'try{Object.defineProperty(window,"localStorage",{value:MS("l"),configurable:true});}catch(e){}' +
   'try{Object.defineProperty(window,"sessionStorage",{value:MS("s"),configurable:true});}catch(e){}' +
+  // Cache Storage: reading window.caches throws in a sandboxed (opaque-origin) frame, which breaks any page
+  // that opens a cache to keep downloads (wasm/zkey files, assets). Provide a working in-memory CacheStorage:
+  // open/match/put/add/delete/keys behave normally for the life of the page, but nothing persists across loads.
+  'try{(function(){' +
+    'var S={};' +
+    'function K(r){try{return (r instanceof Request)?r.url:new URL(String(r),location.href).href;}catch(e){return String(r);}}' +
+    'function C(n){var m=S[n]||(S[n]=new Map());return{' +
+      'match:function(r){var v=m.get(K(r));return Promise.resolve(v?v.clone():undefined);},' +
+      'matchAll:function(r){if(r===undefined)return Promise.resolve(Array.from(m.values()).map(function(v){return v.clone();}));var v=m.get(K(r));return Promise.resolve(v?[v.clone()]:[]);},' +
+      'put:function(r,res){m.set(K(r),res);return Promise.resolve();},' +
+      'add:function(r){return fetch(r).then(function(res){if(!res.ok)throw new TypeError("Request failed");m.set(K(r),res);});},' +
+      'addAll:function(rs){return Promise.all(Array.from(rs).map(function(r){return this.add(r);},this)).then(function(){});},' +
+      'delete:function(r){return Promise.resolve(m.delete(K(r)));},' +
+      'keys:function(){return Promise.resolve(Array.from(m.keys()).map(function(u){return new Request(u);}));}' +
+    '};}' +
+    'var cs={' +
+      'open:function(n){return Promise.resolve(C(String(n)));},' +
+      'has:function(n){return Promise.resolve(String(n) in S);},' +
+      'delete:function(n){n=String(n);var had=n in S;delete S[n];return Promise.resolve(had);},' +
+      'keys:function(){return Promise.resolve(Object.keys(S));},' +
+      'match:function(r){var k=K(r);for(var n in S){var v=S[n].get(k);if(v)return Promise.resolve(v.clone());}return Promise.resolve(undefined);}' +
+    '};' +
+    'Object.defineProperty(window,"caches",{get:function(){return cs;},configurable:true});' +
+  '})();}catch(e){}' +
   // history.replaceState/pushState shim. In this opaque-origin srcdoc frame (origin "null", URL
   // about:srcdoc) a relative URL resolves against the PARENT frame (chrome-extension://…), so any
   // "#hash", "/path" or "?query" URL throws SecurityError. That breaks apps that keep the hash in
@@ -326,6 +356,8 @@ return '<scr' + 'ipt>(function(){' +
       '}' +
     '}catch(ex){}' +
   '},true);' +
+  // Report presses so the host's network/account pill can close its menu (cross-frame presses are invisible to it).
+  'window.addEventListener("pointerdown",function(){try{window.parent.postMessage({type:"page-press"},"*");}catch(e){}},true);' +
   // Signal to renderer that the polyfill is set up and ready for wallet events.
   'window.parent.postMessage({type:"polyfill-ready"},"*");' +
 '})();<\/scr' + 'ipt>'
