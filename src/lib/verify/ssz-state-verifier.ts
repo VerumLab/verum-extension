@@ -954,8 +954,8 @@ function computeBeaconStateRootGloas(stateSSZ: Uint8Array): BeaconStateVerificat
       return btoa(s)
     },
     computeHistoricalSummariesFieldProof(): string {
-      // Progressive-container field proof not ported; the era-tail fast path is
-      // disabled for Gloas (full-state download is used instead), so this is unused.
+      // Progressive-container field proof not ported. The era-tail fast path is disabled for Gloas (full-state
+      // download is used instead) and callers must not build a proof cache for a Gloas state (see beacon-verifier).
       throw new Error('historical_summaries field proof not supported for Gloas (use full-state path)')
     },
     getFieldRoots(): string[] { return fieldRoots.map(hexlify) },

@@ -614,7 +614,10 @@ export async function verifyViaBeacon(
           }
         } catch { /* try next */ }
       }
-      if (effectiveBeaconRoot) {
+      // The cache only saves the next verification a full-state download. Its field proof is not ported for
+      // Gloas (a progressive-container state), and asking for it throws — which used to abort a pipeline that had
+      // already succeeded. Skip caching for Gloas states; the full state is simply downloaded again next time.
+      if (effectiveBeaconRoot && !isGloasSlot(chainId, effectiveSlot)) {
         newBsrCache = {
           effectiveSlot,
           effectiveBeaconRoot,

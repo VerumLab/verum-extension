@@ -1,6 +1,7 @@
 import { w3log } from '../log'
 import { HeliosWasmClient } from './helios-wasm.js'
 import type { ChainConfig } from '../../types.js'
+import { timestampToSlot } from '../verify/beacon-primitives.js'
 
 export interface IVerifiedRpc {
   request<T>(method: string, params: unknown[], quickFail?: boolean): Promise<T>
@@ -15,11 +16,32 @@ export interface IVerifiedRpc {
 //   w3-exec-{chainId}-{idx}.invalid — execution JSON-RPC (POST to base URL)
 //   w3-cons-{chainId}-{idx}.invalid — consensus beacon REST (path appended)
 // Light-client updates are sync-committee-signed, so mixing consensus
-// providers per-request is safe — Helios verifies every response.
+// providers per-request is safe for AUTHENTICITY — Helios verifies every response. It is not safe for
+// FRESHNESS: a provider whose light-client server has stalled (it happened to a Sepolia endpoint at the
+// Glamsterdam fork) still answers 200 with valid but old data, which Helios rejects ("update not relevant")
+// and the whole sync fails. The proxy therefore also fails over past providers serving stale data.
 // ---------------------------------------------------------------------------
 const _proxyRpcs       = new Map<string, string[]>()  // sentinel key → rpcs
 const _proxyIdx        = new Map<string, number>()    // sentinel key → round-robin counter
 const _proxyBlacklist  = new Map<string, Set<string>>() // sentinel key → permanently broken RPCs
+const _proxyStale      = new Map<string, number>()    // `${sentinel key}|${rpc}` → time until which it is skipped (stale light-client data)
+
+// How far behind real time the attested slot of a "latest" light-client update may be before the provider
+// is considered stale. Optimistic updates track the head (normally seconds behind); finality updates only
+// change once per epoch, so their attested slot can legitimately trail by several minutes.
+const STALE_MAX_SECONDS = { optimistic_update: 300, finality_update: 900 } as const
+const STALE_SKIP_MS = 5 * 60_000
+
+// Seconds the response's attested slot trails the wall clock, or null when it can't be told (not JSON, no
+// slot, unknown chain) — null means "don't judge", so an unusual body never causes a failover by itself.
+async function lightClientLagSeconds(res: Response, chainId: number): Promise<number | null> {
+  try {
+    const body = await res.clone().json() as { data?: { attested_header?: { beacon?: { slot?: string } } } }
+    const slot = Number(body?.data?.attested_header?.beacon?.slot)
+    if (!Number.isFinite(slot)) return null
+    return (timestampToSlot(Math.floor(Date.now() / 1000), chainId) - slot) * 12
+  } catch { return null }
+}
 
 // Proxy-level cache for immutable exec reads. Helios re-verifies every response
 // against the trusted state root, so caching cannot weaken the trust model — it only
@@ -304,6 +326,8 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
       // Helios never sees a network error — it just perceives a slow response.
       for (let attempt = 0; attempt < rpcs.length; attempt++) {
         const rpc = rpcs[(startIdx + attempt) % rpcs.length]
+        // A provider recently seen serving stale light-client data is skipped while others remain.
+        if (isCons && attempt < rpcs.length - 1 && (_proxyStale.get(`${proxyKey}|${rpc}`) ?? 0) > Date.now()) continue
 
         const ctrl = new AbortController()
         // Consensus responses (bootstrap, update batches) can be MBs allow longer.
@@ -320,6 +344,17 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
             return res
           }
           if (isCons) {
+            const latest = /\/eth\/v1\/beacon\/light_client\/(optimistic_update|finality_update)(?:$|\?)/.exec(path)
+            if (latest) {
+              const lag = await lightClientLagSeconds(res, Number(proxyKey.split('-')[2]))
+              const limit = STALE_MAX_SECONDS[latest[1] as keyof typeof STALE_MAX_SECONDS]
+              if (lag !== null && lag > limit) {
+                _proxyStale.set(`${proxyKey}|${rpc}`, Date.now() + STALE_SKIP_MS)
+                console.warn(`[w3] consensus ${host} is serving stale ${latest[1]} (${Math.round(lag)}s behind) — ` +
+                  (attempt < rpcs.length - 1 ? 'trying the next provider' : 'no other provider left, using it anyway'))
+                if (attempt < rpcs.length - 1) continue
+              }
+            }
             if (path.startsWith('/eth/v1/beacon/light_client/updates')) {
               const repaired = await repairLightClientUpdates(res, path)
               if (repaired) return repaired
@@ -447,13 +482,13 @@ export async function createVerifiedRpc(chain: ChainConfig, forceFresh = false):
 
 type HeliosNet = Parameters<typeof HeliosWasmClient.create>[0]
 
-// chainId → Helios consensus preset, for the ethereum-kind networks Helios ships. Verum wires
+// chainId → Helios consensus preset, for the ethereum-kind networks Helios ships (Helios 0.12 no longer ships
+// holesky). Verum wires
 // Helios through a consensus-beacon proxy, which only fits Helios's "ethereum" NetworkKind — its
 // opstack and linea kinds use a different config (verifiableApi / no consensus RPC) and aren't
 // wired here, so verification is limited to these networks.
 const HELIOS_NETWORK_BY_CHAIN: Record<number, HeliosNet> = {
   1:        'mainnet',
-  17000:    'holesky',
   560048:   'hoodi',
   11155111: 'sepolia',
 }

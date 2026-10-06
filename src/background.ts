@@ -8,6 +8,7 @@ import { parseCalldata, assembleContent } from './lib/w3/content.js'
 import { resolveName, nameIsIpfs, reverifyName } from './lib/w3/name-resolver.js'
 import type { TxRef, NameResolution } from './lib/w3/name-resolver.js'
 import { fetchContractContent } from './lib/w3/erc5219.js'
+import { waitForExecutionHead } from './lib/rpc/oos-probe.js'
 import type { ContractContent } from './lib/w3/erc5219.js'
 import { verifyViaBeacon, isEip2935Error, SUPERSEDED } from './lib/verify/beacon-verifier.js'
 import { timestampToSlot } from './lib/verify/beacon-primitives.js'
@@ -37,6 +38,10 @@ async function agreementAccepted(): Promise<boolean> {
 // Lag (seconds behind) at which an OOS instance is considered unrecoverable and
 // the WASM is torn down and re-synced, rather than re-probed in place.
 const OOS_RESTART_LAG_SECONDS = 150
+// A fresh instance starts minutes behind and normally recovers within ~30s; do not call it wedged before this,
+// and give up on the probe after the budget (the exhaustion path then restarts it if it is still stuck).
+const OOS_WEDGE_GRACE_MS = 90_000
+const OOS_PROBE_BUDGET_MS = 150_000
 
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
 
@@ -233,33 +238,24 @@ function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
 function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
   if (!freshRpcCache.has(chain.chainId)) {
     const p = getOrCreateRpc(chain).then(async rpc => {
-      // Retry eth_blockNumber until execution state is past the out-of-sync guard.
-      // waitSynced() confirms consensus but execution may be briefly behind — once
-      // eth_blockNumber succeeds, the head is within the OOS threshold and Helios
-      // can serve all calls. Fast 500ms retries (vs old 1s new-block wait).
-      const t0 = Date.now()
-      let lastLag = '?'
-      let wedged = false
-      for (let i = 0; i < 120; i++) {
-        try {
-          await rpc.request<string>('eth_blockNumber', [], true)  // quickFail — skip internal 3s retry
-          if (i > 0) w3log(`[w3] Helios OOS probe resolved in ${Math.round((Date.now() - t0) / 1000)}s`)
-          return rpc  // execution head confirmed live
-        } catch (err: any) {
-          if (!(err?.message ?? '').includes('out of sync')) return rpc  // non-OOS error, proceed
-          lastLag = (err.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
-          if (Number(lastLag) >= OOS_RESTART_LAG_SECONDS) { wedged = true; break }
-        }
-        if (i > 0 && i % 10 === 0) {
-          w3log(`[w3] Helios OOS probe still waiting (${Math.round((Date.now() - t0) / 1000)}s, ${lastLag}s behind)…`)
-        }
-        await new Promise(r => setTimeout(r, 500))
+      // Wait for the execution head to get past the out-of-sync guard. A new instance starts minutes behind
+      // and normally catches up by itself, so it is only restarted when it is not recovering (see oos-probe.ts).
+      const res = await waitForExecutionHead(() => rpc.request<string>('eth_blockNumber', [], true), {  // quickFail — skip internal 3s retry
+        wedgeLag: OOS_RESTART_LAG_SECONDS,
+        graceMs: OOS_WEDGE_GRACE_MS,
+        budgetMs: OOS_PROBE_BUDGET_MS,
+        onWaiting: (s, lag) => w3log(`[w3] Helios OOS probe still waiting (${s}s, ${lag}s behind)…`),
+      })
+      if (res.kind === 'ready') {
+        if (res.waitedMs > 600) w3log(`[w3] Helios OOS probe resolved in ${Math.round(res.waitedMs / 1000)}s`)
+        return rpc  // execution head confirmed live
       }
+      if (res.kind === 'other-error') return rpc  // non-OOS error, proceed
       // Probe exhausted (or wedged). Clear self from the cache so the rejection
       // handler / next ping recreates a probe rather than returning this rejected
       // promise. Do NOT set freshRpcReady with an OOS instance.
       freshRpcCache.delete(chain.chainId)
-      throw new Error(wedged ? `Helios OOS wedged (${lastLag}s behind)` : 'Helios OOS probe exhausted')
+      throw new Error(res.kind === 'wedged' ? `Helios OOS wedged (${res.lag}s behind)` : 'Helios OOS probe exhausted')
     })
     p.then(
       (rpc) => {

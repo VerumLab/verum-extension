@@ -189,25 +189,45 @@ export function compareEnsChunks(heliosChunks: TxRef[], phase1Chunks: TxRef[]): 
 
 // Re-resolve a name through Helios and compare it to the phase-1 chunks, retrying on a
 // transient failure. 
+// Helios (or the RPC) could not run the call at all. This must never be reported as "the name has no record":
+// that is a statement about the chain, and nothing was read.
+const isInfraError = (e: unknown) => /out of sync|shut down|wasm call timeout|not available/i.test((e as Error)?.message ?? '')
+
 export async function reverifyName(
   name: string,
   rpc: IVerifiedRpc,
   phase1Chunks: TxRef[],
   attempts = 4,
   delayMs = 1500,
+  heliosWaitMs = 180_000,
 ): Promise<boolean | undefined> {
-  for (let i = 0; i < attempts; i++) {
+  // A freshly started Helios is typically 1-2 minutes behind and needs a while to catch up (or for its watchdog
+  // to restart it). That is "not ready yet", not a failed check, so keep asking until it answers or the budget
+  // runs out. Any other failure keeps the original short retry.
+  const heliosDeadline = Date.now() + heliosWaitMs
+  const notReady = isInfraError
+  for (let i = 0; ; i++) {
+    let wait = delayMs
     try {
       const { chunks } = await resolveEns(name, rpc)
       const result = compareEnsChunks(chunks, phase1Chunks)
       if (result !== undefined) return result   // Helios resolved definitively (match / mismatch)
+      if (i >= attempts - 1) return undefined
     } catch (e) {
-      if (i === attempts - 1) console.warn(`[w3] name re-verification for "${name}" gave up after ${attempts} tries:`, (e as Error).message ?? e)
-      // else: transient cold-Helios failure — fall through and retry
+      if (notReady(e)) {
+        if (Date.now() >= heliosDeadline) {
+          console.warn(`[w3] name re-verification for "${name}" gave up — Helios still not ready after ${Math.round(heliosWaitMs / 1000)}s:`, (e as Error).message ?? e)
+          return undefined
+        }
+        wait = 3000
+      } else if (i >= attempts - 1) {
+        console.warn(`[w3] name re-verification for "${name}" gave up after ${attempts} tries:`, (e as Error).message ?? e)
+        return undefined
+      }
+      // else: transient failure — fall through and retry
     }
-    if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs))
+    await new Promise(r => setTimeout(r, wait))
   }
-  return undefined
 }
 
 function serviceName(name: string): string {
@@ -247,6 +267,7 @@ export async function resolveEns(
   const resolver = await resolverForName(rpc, name, node)
 
   const raw = await getText(rpc, resolver, node, 'w3').catch((e: unknown) => {
+    if (isInfraError(e)) throw e          // not ready is not "no record" — let the caller retry
     console.warn(`[w3] getText failed for "${name}":`, (e as Error).message ?? e)
     return null
   })
@@ -275,11 +296,11 @@ export async function resolveName(
   const node = namehash(name)
   const resolver = await resolverForName(rpc, name, node)
 
-  const w3 = await getText(rpc, resolver, node, 'w3').catch(() => null)
+  const w3 = await getText(rpc, resolver, node, 'w3').catch((e: unknown) => { if (isInfraError(e)) throw e; return null })
   if (w3) return { kind: 'chunks', chunks: parseW3Record(service, w3) }
 
   // ERC-6821: content contract, with the addr record as fallback.
-  const cc = await getText(rpc, resolver, node, 'contentcontract').catch(() => null)
+  const cc = await getText(rpc, resolver, node, 'contentcontract').catch((e: unknown) => { if (isInfraError(e)) throw e; return null })
   if (cc) {
     const parsed = parseContentContract(cc)
     if (parsed) return { kind: 'contract', ...parsed }

@@ -11,7 +11,7 @@
     "check:helios": "node scripts/check-helios.mjs"
   },
   "dependencies": {
-    "@a16z/helios": "^0.11.1",
+    "@a16z/helios": "^0.12.0",
     "ethers": "^6.13.0",
     "hyparquet": "^1.26.1",
     "hyparquet-compressors": "^1.1.1"
