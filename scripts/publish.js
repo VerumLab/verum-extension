@@ -44,6 +44,12 @@ const wallet   = new Wallet(PRIVATE_KEY, provider)
 const { chainId } = await provider.getNetwork()
 console.error(`Chain ID: ${chainId}`)
 
+// Which gas pricing the chain uses, from the cost of an empty transaction: 21,000 before Glamsterdam,
+// 15,000 after.
+const glamsterdam =
+  (await provider.estimateGas({ to: '0x0000000000000000000000000000000057334653', data: '0x' })) < 21000n
+console.error(`Gas pricing: ${glamsterdam ? 'Glamsterdam' : 'before Glamsterdam'}`)
+
 const balance = await provider.getBalance(wallet.address)
 console.error(`Sender:  ${wallet.address}`)
 console.error(`Balance: ${Number(balance) / 1e18} ETH`)
@@ -62,17 +68,23 @@ for (let i = 0; i < lines.length; i++) {
   const bytes = calldata.length / 2 - 1
   console.error(`\n[${i + 1}/${lines.length}] Sending ${bytes.toLocaleString()} bytes...`)
 
-  // Calculate gas manually to skip eth_estimateGas (public RPCs reject large request bodies).
-  // EIP-7623 (Pectra): floor data gas = (zero_bytes×1 + nonzero_bytes×4) × 10
-  // For gzip output (~99% non-zero) this is ~40 gas/byte vs the old 16 gas/byte.
+  // Calculated rather than estimated: public RPCs reject eth_estimateGas for large request bodies.
+  // Glamsterdam (measured on Sepolia): 15,000 base and about 64.5 gas per byte, zero or not, plus 10%.
+  // Before it, EIP-7623: max(standard, floor) + 21,000 base + buffer, the floor being
+  // (zero_bytes×1 + nonzero_bytes×4) × 10.
   const raw = Buffer.from(calldata.slice(2), 'hex')
-  let zeros = 0n, nonzeros = 0n
-  for (const b of raw) { if (b === 0) zeros++; else nonzeros++ }
-  const tokens = zeros * 1n + nonzeros * 4n
-  const standardDataGas = zeros * 4n + nonzeros * 16n
-  const floorDataGas = tokens * 10n
-  const dataGas = standardDataGas > floorDataGas ? standardDataGas : floorDataGas
-  const gasLimit = 21000n + dataGas + 50000n
+  let gasLimit
+  if (glamsterdam) {
+    const gas = 15000n + (BigInt(raw.length) * 645n) / 10n
+    gasLimit = gas + gas / 10n
+  } else {
+    let zeros = 0n, nonzeros = 0n
+    for (const b of raw) { if (b === 0) zeros++; else nonzeros++ }
+    const standardDataGas = zeros * 4n + nonzeros * 16n
+    const floorDataGas = (zeros * 1n + nonzeros * 4n) * 10n
+    const dataGas = standardDataGas > floorDataGas ? standardDataGas : floorDataGas
+    gasLimit = 21000n + dataGas + 50000n
+  }
 
   // Send to the W3FS data deposit address — a recognizable fixed address for calldata storage.
   // Nobody holds the private key to 0x...57334653 (W3FS magic bytes padded to 20 bytes).

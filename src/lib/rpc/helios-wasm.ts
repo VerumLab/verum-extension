@@ -2,24 +2,28 @@ import { w3log } from '../log'
 import { createHeliosProvider } from '@a16z/helios'
 import type { HeliosProvider, Network } from '@a16z/helios'
 import type { IVerifiedRpc } from './light-client.js'
+import { pinnedCheckpointKey, CHECKPOINT_REUSE_MS, type PinnedCheckpoint } from '../verify/checkpoint-info.js'
 
 // EIP-4788 ring buffer — used as a probe to verify eth_getProof works on the exec RPC.
 const EIP4788_PROBE = '0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02'
 
 export class HeliosWasmClient implements IVerifiedRpc {
-  private lastCheckpointSave = 0
   // Number of provider.request() calls currently awaiting the WASM, and a barrier that
   // shutdown() waits on.
   // This lets an OOS-wedge restart evict-and-replace the instance without crashing an
   // in-flight verification call on it.
+  static alive = 0   // Helios WASM instances created and not yet shut down
   private inFlight = 0
   private idleWaiters: Array<() => void> = []
   private shuttingDown = false
   private constructor(
     private readonly provider: HeliosProvider,
-    private readonly checkpointKey: string,
-    private readonly consensusRpc: string,
+    // The checkpoint (beacon block root) THIS instance was started from. Helios only accepts a bootstrap whose
+    // header hashes to it, so it is the instance's trust anchor; it is what Verum shows and cross-checks.
+    readonly checkpoint: string,
   ) {}
+
+  checkpointRoot(): string { return this.checkpoint }
 
   // Races up to 2 execution RPCs with an EIP-4788 proof probe; first to pass wins.
   // Falls back to the first exec RPC unprobed if all probes fail.
@@ -29,26 +33,49 @@ export class HeliosWasmClient implements IVerifiedRpc {
     executionRpcs: string[],
     forceFresh = false,
   ): Promise<HeliosWasmClient> {
-    const checkpointKey = `helios_checkpoint_${network}`
-    // A  instance restart passes forceFresh so the replacement re-anchors
-    // from a freshly-fetched finalized root instead of the checkpoint cached by
-    // the instance that just wedged — reusing that value rebuilds the same anchor
-    // and re-wedges. The fresh root is still saved below for the next warm start.
-    const stored = forceFresh ? {} : await chrome.storage.session.get(checkpointKey)
-    // The stored checkpoint carries savedAt so a stale root (bootstrap endpoints 404 old
-    // roots) is skipped instead of burning a doomed sync attempt before the live-root retry.
-    const cached = stored[checkpointKey] as { root: string; savedAt: number } | undefined
-    const cachedCheckpoint = cached && Date.now() - cached.savedAt < 20 * 60_000
-      ? cached.root : undefined
+    // Helios starts from the checkpoint the user checked or chose (pinned for a day, CHECKPOINT_REUSE_MS, surviving
+    // restarts) so they don't have to compare a new hash on every start. Without such a pin — or when no provider
+    // still serves its bootstrap — it starts from the current finalized root, which the sources (or the user) must
+    // confirm before anything is verified. A restart after a wedge (forceFresh) keeps the pin too: the stalls come
+    // from stale finality updates, not from the checkpoint. Never starts without a checkpoint (Helios would fall back
+    // to its own built-in one, months old and not the hash Verum shows).
+    void forceFresh
+    const pinKey = pinnedCheckpointKey(network)
+    const pin = (await chrome.storage.local.get(pinKey).catch(() => ({})) as Record<string, unknown>)[pinKey] as PinnedCheckpoint | undefined
+    const cachedCheckpoint = pin?.userChosen && Date.now() - pin.adoptedAt < CHECKPOINT_REUSE_MS ? pin.root : undefined
 
-    const sync = (execRpc: string): Promise<HeliosProvider> =>
-      cachedCheckpoint
-        ? HeliosWasmClient.syncWithFallback(network, consensusRpc, execRpc, cachedCheckpoint)
-        : HeliosWasmClient.syncFresh(network, consensusRpc, execRpc)
+    // The root each start uses is returned with its provider, so the instance always reports the root it really
+    // started from (also after falling back from the pin to a fresh root).
+    const sync = async (execRpc: string): Promise<{ provider: HeliosProvider; root: string }> => {
+      if (cachedCheckpoint) {
+        try {
+          return { provider: await HeliosWasmClient.trySync(network, consensusRpc, execRpc, cachedCheckpoint, 'pinned checkpoint'), root: cachedCheckpoint }
+        } catch (err) {
+          // Providers keep light-client bootstrap data only for recent checkpoints (on Sepolia: only the latest one).
+          w3log('[w3] Helios pinned checkpoint unavailable — starting from a fresh finalized root (to be confirmed again):', (err as Error).message)
+          // Drop the dead pin (unless the user pinned another root meanwhile), so later starts don't retry it.
+          const now = (await chrome.storage.local.get(pinKey).catch(() => ({})) as Record<string, unknown>)[pinKey] as PinnedCheckpoint | undefined
+          if (now?.root === cachedCheckpoint) await chrome.storage.local.remove(pinKey).catch(() => {})
+        }
+      }
+      // A provider may serve the bootstrap only for the LATEST finalized root, so finality moving on between fetching
+      // the root and the bootstrap fails the start: fetch the root again and retry once.
+      for (let attempt = 0; ; attempt++) {
+        const fresh = await HeliosWasmClient.fetchFinalizedRoot(consensusRpc)
+        if (!fresh) throw new Error('Helios not started: no checkpoint — the consensus RPC returned no finalized root')
+        try {
+          return { provider: await HeliosWasmClient.trySync(network, consensusRpc, execRpc, fresh, 'live finalized root'), root: fresh }
+        } catch (err) {
+          if (attempt >= 1) throw err
+          w3log('[w3] Helios start from the finalized root failed — fetching the current one and retrying once:', (err as Error).message)
+        }
+      }
+    }
 
-    const syncAndProbe = async (execRpc: string): Promise<HeliosProvider> => {
+    const syncAndProbe = async (execRpc: string): Promise<{ provider: HeliosProvider; root: string }> => {
       const host = execRpc.includes('.invalid') ? 'proxy' : new URL(execRpc).hostname
-      const provider = await sync(execRpc)
+      const started = await sync(execRpc)
+      const provider = started.provider
       w3log(`[w3] Helios (exec=${host}) probing EIP-4788…`)
       try {
         const block = await provider.request({
@@ -66,54 +93,27 @@ export class HeliosWasmClient implements IVerifiedRpc {
         await provider.shutdown().catch(() => {})
         throw err
       }
-      return provider
+      return started
     }
 
     const candidates = executionRpcs.slice(0, 2)
-    let provider: HeliosProvider
+    let started: { provider: HeliosProvider; root: string }
 
     if (candidates.length === 1) {
-      provider = await sync(candidates[0])
+      started = await sync(candidates[0])
     } else {
       const attempts = candidates.map(rpc => syncAndProbe(rpc))
-      provider = await Promise.any(attempts).catch(async () => {
+      started = await Promise.any(attempts).catch(async () => {
         console.warn('[w3] All exec RPC probes failed — using first RPC unprobed')
         return sync(candidates[0])
       })
       // Shut down any extra provider that synced but lost the race.
       for (const p of attempts) {
-        p.then(winner => { if (winner !== provider) winner.shutdown().catch(() => {}) }).catch(() => {})
+        p.then(w => { if (w.provider !== started.provider) w.provider.shutdown().catch(() => {}) }).catch(() => {})
       }
     }
 
-    const finalizedRoot = await HeliosWasmClient.fetchFinalizedRoot(consensusRpc)
-    if (finalizedRoot) await chrome.storage.session.set({ [checkpointKey]: { root: finalizedRoot, savedAt: Date.now() } })
-
-    return new HeliosWasmClient(provider, checkpointKey, consensusRpc)
-  }
-
-  private static async syncWithFallback(
-    network: Network,
-    consensusRpc: string,
-    executionRpc: string,
-    cachedCheckpoint: string,
-  ): Promise<HeliosProvider> {
-    try {
-      return await HeliosWasmClient.trySync(network, consensusRpc, executionRpc, cachedCheckpoint, 'cached checkpoint')
-    } catch {
-      w3log('[w3] Helios cached checkpoint failed — retrying with live finalized root')
-      return HeliosWasmClient.syncFresh(network, consensusRpc, executionRpc)
-    }
-  }
-
-  private static async syncFresh(
-    network: Network,
-    consensusRpc: string,
-    executionRpc: string,
-  ): Promise<HeliosProvider> {
-    const hint = await HeliosWasmClient.fetchFinalizedRoot(consensusRpc)
-    return HeliosWasmClient.trySync(network, consensusRpc, executionRpc, hint,
-      hint ? 'live finalized root' : 'no checkpoint hint')
+    return new HeliosWasmClient(started.provider, started.root)
   }
 
   // Slots per epoch — light-client bootstrap data is indexed per epoch boundary.
@@ -156,7 +156,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
     network: Network,
     consensusRpc: string,
     executionRpc: string,
-    checkpoint: string | undefined,
+    checkpoint: string,
     checkpointLabel: string,
   ): Promise<HeliosProvider> {
     const execHost = executionRpc.includes('.invalid') ? 'proxy' : new URL(executionRpc).hostname
@@ -166,13 +166,23 @@ export class HeliosWasmClient implements IVerifiedRpc {
     // "localstorage" and "config" exist. localStorage does not exist in a service
     // worker.
     //
-    // Fix: persist the checkpoint in chrome.storage.session (see saveCheckpoint /
-    // fetchFinalizedRoot) and hand it in via `checkpoint` on every start. Helios
-    // then reads the checkpoint from config and stops pretending it has a DB.
+    // Fix: Verum keeps the checkpoint itself (pinned for a day in chrome.storage.local, see create())
+    // and hands it in via `checkpoint` on every start. Helios then reads the checkpoint from config
+    // and stops pretending it has a DB.
     const provider = await createHeliosProvider(
       { network, consensusRpc, executionRpc, dbType: 'config', checkpoint },
       'ethereum',
     )
+    // Diagnostic for the extension-process crashes: every WASM instance not shut down keeps its memory, so a count
+    // that keeps growing across restarts is a leak.
+    HeliosWasmClient.alive++
+    w3log(`${tag} Helios instances alive: ${HeliosWasmClient.alive}`)
+    const shutdownOnce = provider.shutdown.bind(provider)
+    let down = false
+    provider.shutdown = async () => {
+      if (!down) { down = true; HeliosWasmClient.alive--; w3log(`${tag} shut down — Helios instances alive: ${HeliosWasmClient.alive}`) }
+      return shutdownOnce()
+    }
     const t1 = Date.now()
     const ticker = setInterval(
       () => w3log(`${tag} still syncing… (${Math.round((Date.now() - t1) / 1000)}s)`),
@@ -185,6 +195,10 @@ export class HeliosWasmClient implements IVerifiedRpc {
           setTimeout(() => reject(new Error('Helios waitSynced timeout')), 30_000),
         ),
       ])
+    } catch (err) {
+      // A start that did not sync keeps its WASM instance and polling loops alive unless shut down.
+      await provider.shutdown().catch(() => {})
+      throw err
     } finally {
       clearInterval(ticker)
     }
@@ -217,7 +231,6 @@ export class HeliosWasmClient implements IVerifiedRpc {
       ])
     try {
       const result = await call()
-      this.saveCheckpoint()
       return result
     } catch (err: any) {
       if ((err?.message ?? '').includes('out of sync')) {
@@ -226,21 +239,11 @@ export class HeliosWasmClient implements IVerifiedRpc {
         console.warn(`[w3] Helios ${method} OOS (${lag}s behind) — retrying in 3s`)
         await new Promise(r => setTimeout(r, 3_000))
         const result = await call()
-        this.saveCheckpoint()
-        return result
+          return result
       }
       console.warn(`[w3] Helios ${method} FAILED after ${Date.now() - startedAt}ms — ${err?.message ?? err}`)
       throw err
     }
-  }
-
-  private saveCheckpoint(): void {
-    const now = Date.now()
-    if (now - this.lastCheckpointSave < 30_000) return
-    this.lastCheckpointSave = now
-    HeliosWasmClient.fetchFinalizedRoot(this.consensusRpc)
-      .then(cp => { if (cp) chrome.storage.session.set({ [this.checkpointKey]: { root: cp, savedAt: Date.now() } }) })
-      .catch(() => {})
   }
 
   isHeliosBacked(): boolean { return true }

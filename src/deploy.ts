@@ -9,12 +9,12 @@ import { buildWebsiteHtml } from './lib/w3/website-html.js'
 import type { BundleFile } from './lib/w3/content.js'
 import {
   encodeBundle, encodeSingleFile, isSkippedPath, sniffType,
-  toHex, txGasLimit, W3FS_DEPOSIT, type DeployFile,
+  toHex, txGasLimit, W3FS_DEPOSIT, scheduleFromEmptyTxGas, type DeployFile, type GasSchedule,
 } from './lib/w3/encoder.js'
 import { DEFAULT_CHAINS, type BgResponse, type ChainConfig } from './types.js'
 import { ensureWalletChain, CHAIN_BOUND_METHODS } from './lib/wallets/chain-guard.js'
 import {
-  dataContractInitcode, siteInitcode, splitIntoDataContracts, dataContractGas, siteContractGas,
+  dataContractInitcode, siteInitcode, splitIntoDataContracts, dataContractGas, siteContractGas, maxDataBytes,
 } from './lib/w3/site-contract.js'
 import { requestChainSwitch, CHAIN_SWITCH_METHODS, chainHex } from './lib/wallets/chain-switch.js'
 
@@ -67,6 +67,10 @@ folderInput.webkitdirectory = true
 // ---------------------------------------------------------------------------
 
 let chain: ChainConfig | undefined
+/** The chain's gas pricing; Glamsterdam until the chain says otherwise, as its limits are the safe side. */
+let gasSchedule: GasSchedule = 'glamsterdam'
+/** The chain's block gas limit, which bounds a slice after Glamsterdam; null until read. */
+let blockGasLimit: bigint | null = null
 let isDirectory = false
 let selectionLabel = ''
 let entries: DeployFile[] = []           // selected files (bundle-relative paths)
@@ -146,6 +150,32 @@ function selectChain(chainId: number) {
   if (chain && !chain.localMode) {
     chrome.runtime.sendMessage({ type: 'warmup-helios', chainId: chain.chainId }).catch(() => {})
   }
+  void detectGasSchedule()
+}
+
+/**
+ * Ask the chain which gas pricing it uses, from what an empty transaction costs there, and its block
+ * gas limit. Slices and the cost summary follow them, unless a deployment is already under way.
+ */
+async function detectGasSchedule(): Promise<void> {
+  const id = chain?.chainId
+  if (id === undefined) return
+  const rpc = (method: string, params: unknown[]) =>
+    (chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: id, method, params }) as
+      Promise<{ result?: any; error?: string }>).catch(() => null)
+  const [empty, block] = await Promise.all([
+    rpc('eth_estimateGas', [{ to: W3FS_DEPOSIT, data: '0x' }]),
+    rpc('eth_getBlockByNumber', ['latest', false]),
+  ])
+  if (chain?.chainId !== id) return
+  const before = maxDataBytes(gasSchedule, blockGasLimit)
+  const scheduleBefore = gasSchedule
+  if (empty?.result) gasSchedule = scheduleFromEmptyTxGas(BigInt(empty.result))
+  if (block?.result?.gasLimit) blockGasLimit = BigInt(block.result.gasLimit)
+  if (gasSchedule === scheduleBefore && maxDataBytes(gasSchedule, blockGasLimit) === before) return
+  if (hasDeployProgress()) return
+  if (contractEligible()) dataSlices = splitIntoDataContracts(entries[0].data, gasSchedule, blockGasLimit)
+  if (calldatas.length > 0 || dataSlices.length > 0) renderSummary()
 }
 
 // Same behaviour as the settings page: the selection IS the default chain, so
@@ -298,7 +328,7 @@ function updateStorageOptions() {
   const eligible = contractEligible()
   radio('contract').disabled = !eligible
   $('storage-opt-contract').title = eligible ? '' : 'Contract code needs a single self-contained HTML file.'
-  dataSlices = eligible ? splitIntoDataContracts(entries[0].data) : []
+  dataSlices = eligible ? splitIntoDataContracts(entries[0].data, gasSchedule, blockGasLimit) : []
   if (!eligible) storageMode = 'calldata'
   radio(storageMode).checked = true
 }
@@ -415,11 +445,11 @@ const txCount = () => storageMode === 'contract' ? dataSlices.length + 1 : calld
 // Gas limits for the whole deployment. Contract mode: one creation tx per data slice plus the site contract.
 function totalGasLimit(): bigint {
   if (storageMode === 'contract') {
-    const data = dataSlices.reduce((n, s) => n + dataContractGas(dataContractInitcode(s), s.length), 0n)
-    const site = siteContractGas(getBytes(siteInitcode(dataSlices.map(() => ZeroAddress))), dataSlices.length)
+    const data = dataSlices.reduce((n, s) => n + dataContractGas(dataContractInitcode(s), s.length, gasSchedule), 0n)
+    const site = siteContractGas(getBytes(siteInitcode(dataSlices.map(() => ZeroAddress))), dataSlices.length, gasSchedule)
     return data + site
   }
-  return calldatas.reduce((n, c) => n + txGasLimit(c), 0n)
+  return calldatas.reduce((n, c) => n + txGasLimit(c, gasSchedule), 0n)
 }
 
 function renderSummary() {
@@ -447,17 +477,24 @@ async function estimateCost() {
     // Match what the wallet actually charges (EIP-1559): base fee (from the latest block) plus a
     // priority tip. eth_gasPrice alone returns roughly the base fee and badly under-counts on
     // low-base-fee networks where the tip dominates (e.g. 0.17 gwei base vs a ~2 gwei tip).
-    const [block, tip] = await Promise.all([
+    const [block, hist] = await Promise.all([
       rpc('eth_getBlockByNumber', ['latest', false]),
-      rpc('eth_maxPriorityFeePerGas', []),
+      rpc('eth_feeHistory', [10, 'latest', [10, 90]]),
     ])
     const baseFee = BigInt(block?.result?.baseFeePerGas ?? '0')
     // Show a slow–fast range, since the fee is the wallet's choice and a data-only deploy has no
-    // urgency (slow is the sensible pick). Tips scale with the network's suggested tip; on quiet
-    // chains that reports ~0, so slow ≈ base fee + a token tip and fast is floored at ~3 gwei.
-    const rpcTip = tip?.result ? BigInt(tip.result) : 0n
-    const slowTip = rpcTip > 0n ? rpcTip / 2n : baseFee / 20n            // half the suggested tip, or ~5% of base
-    const fastTip = rpcTip * 2n > 3_000_000_000n ? rpcTip * 2n : 3_000_000_000n   // ≥3 gwei
+    // urgency (slow is the sensible pick). Tips are what recent blocks actually paid, each the median
+    // over the last 10 blocks: slow = the 10th-percentile tip (while blocks aren't full a tiny tip is
+    // included in the next block), floored at 0.001 gwei; fast = the 90th-percentile tip. Wallets
+    // usually suggest more than slow, hence the "check your wallet" note next to it.
+    const rewards: string[][] = hist?.result?.reward ?? []
+    const medianAt = (col: number) => {
+      const v = rewards.map(r => BigInt(r[col] ?? '0')).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      return v.length ? v[v.length >> 1] : 0n
+    }
+    const MIN_TIP = 1_000_000n   // 0.001 gwei
+    const slowTip = medianAt(0) > MIN_TIP ? medianAt(0) : MIN_TIP
+    const fastTip = medianAt(1) > slowTip ? medianAt(1) : slowTip
     let slowFee = baseFee > 0n ? baseFee + slowTip : 0n
     let fastFee = baseFee > 0n ? baseFee + fastTip : 0n
     if (fastFee === 0n) {                                                // pre-1559 chain — single price
@@ -466,7 +503,8 @@ async function estimateCost() {
       slowFee = g; fastFee = g
     }
     if (fastFee === 0n) throw new Error('no fee data')
-    const fmtEth = (w: bigint) => (Number(w) / 1e18).toFixed(5)
+    // Two significant digits, so small amounts don't round to 0.00000.
+    const fmtEth = (w: bigint) => (Number(w) / 1e18).toLocaleString('en-US', { maximumSignificantDigits: 2 })
     costEl.textContent = slowFee === fastFee || slowFee === 0n
       ? `~${fmtEth(totalGas * fastFee)} ETH`
       : `slow ~${fmtEth(totalGas * slowFee)} ETH · fast ~${fmtEth(totalGas * fastFee)} ETH`
@@ -1001,8 +1039,8 @@ async function sendContractTransactions() {
     const isSite = i === dataSlices.length
     const init = isSite ? siteInitcode(contractAddrs) : toHex(dataContractInitcode(dataSlices[i]))
     const gas = '0x' + (isSite
-      ? siteContractGas(getBytes(init), dataSlices.length)
-      : dataContractGas(getBytes(init), dataSlices[i].length)).toString(16)
+      ? siteContractGas(getBytes(init), dataSlices.length, gasSchedule)
+      : dataContractGas(getBytes(init), dataSlices[i].length, gasSchedule)).toString(16)
 
     const from = await refreshAccount()
     if (!from) {
@@ -1069,7 +1107,6 @@ async function sendTransactions(cap?: number) {
   for (; nextTxIndex < calldatas.length; nextTxIndex++) {
     const i = nextTxIndex
     const data = toHex(calldatas[i])
-    const gas = '0x' + txGasLimit(calldatas[i]).toString(16)
 
     // Pick up an account switch made in the wallet since the last chunk.
     const from = await refreshAccount()
@@ -1083,6 +1120,7 @@ async function sendTransactions(cap?: number) {
     }
 
     setTxStatus(i, 'approve in wallet…')
+    const gas = '0x' + txGasLimit(calldatas[i], gasSchedule).toString(16)
     const sent = await walletRpc('eth_sendTransaction', [{ from, to: W3FS_DEPOSIT, data, gas }])
     if (sent.error || typeof sent.result !== 'string') {
       // Safety net: the real tx hit a size limit the probe under-shot. Nothing has been
@@ -1170,7 +1208,7 @@ retryVerify.addEventListener('click', () => verifyWhenReady())
 // every mode fails and the user is told to "retry shortly" for a race they cannot
 // see. Wait for Helios's verified head to actually reach the block first.
 async function waitForHeliosHead(target: number): Promise<boolean> {
-  const deadline = Date.now() + 4 * 60_000
+  const deadline = Date.now() + 60_000   // keep it short: on a timeout the user can retry
   let last = 0
   while (Date.now() < deadline) {
     let head = 0
@@ -1205,7 +1243,7 @@ async function verifyWhenReady() {
 
   const caughtUp = await waitForHeliosHead(target)
   if (!caughtUp) {
-    verifyFailed(`The light client did not reach block ${target} within 4 minutes.`)
+    verifyFailed(`The light client did not reach block ${target} within 1 minute — it may still be catching up. Retry in a moment.`)
     return
   }
   runVerification()
@@ -1229,9 +1267,9 @@ function runVerification() {
     if (!verifySettled) {
       verifySettled = true
       port.disconnect()
-      verifyFailed('Verification timed out after 3 minutes. Helios may still be syncing — retry in a moment.')
+      verifyFailed('Verification did not finish within 1 minute — the light client may still be catching up. Retry in a moment.')
     }
-  }, 180_000)
+  }, 60_000)
 
   port.onMessage.addListener((msg: BgResponse) => {
     if (verifySettled) return
@@ -1263,7 +1301,9 @@ function runVerification() {
         stepName.classList.remove('hidden')
         stepName.scrollIntoView({ behavior: 'smooth', block: 'start' })
       } else {
-        verifyFailed(`Verification did not complete (${mode}). The block may be too fresh for Helios — retry shortly.`)
+        verifyFailed(msg.heliosError
+            ? `Helios could not verify: ${msg.heliosError.replace(/[.\s]+$/, '')}. Retry shortly.`
+            : `Verification did not complete (${mode}). The block may be too fresh for Helios — retry shortly.`)
       }
     }
   })

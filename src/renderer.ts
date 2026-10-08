@@ -1,3 +1,5 @@
+import { copyButton, selectable, selectingText } from './lib/ui/copy-button.js'
+import { checkpointInfoKey, checkpointCheckState, checkpointAgreement, checkpointCandidates, type CheckpointInfo } from './lib/verify/checkpoint-info.js'
 import { formatWeb3URL, parseWeb3URL } from './lib/w3/url-parser.js'
 import { parseBundle, bundleFileAt } from './lib/w3/content.js'
 import { buildWebsiteHtml } from './lib/w3/website-html.js'
@@ -71,6 +73,9 @@ function setPhase(phase: Phase) {
     unverifiedModalMsg.textContent = `This ${contentLabel} is still being verified. Content authenticity is not yet confirmed.`
     unverifiedGate.classList.toggle('hidden', !pageHasScripts && renderMode !== 'raw')
     unverifiedModal.classList.add('hidden')
+    // The checkpoint result may already be known: show "verify manually" while verification waits for it.
+    checkpointWarningShown = false
+    applyCheckpointWarning()
   } else {
     unverifiedGate.classList.add('hidden')
     unverifiedModal.classList.add('hidden')
@@ -867,6 +872,28 @@ function pickWallet(wallets: Array<{ name: string; id: string }>): Promise<strin
 // bails before opening a second web3-resolve port (which would kick off a redundant, expensive
 // Phase-2 pipeline in the background for the same tab).
 let navSeq = 0
+// "Verifying — waiting for Helios (m:ss)": the background keeps trying while the page is open; this shows for how
+// long, and what it is waiting for (badge tooltip).
+let heliosWaitTimer: ReturnType<typeof setInterval> | undefined
+function showHeliosWait(since: number, detail: string) {
+  clearInterval(heliosWaitTimer)
+  const tick = () => {
+    if (checkpointWarningShown) { stopHeliosWait(); return }   // the checkpoint warning took over the badge
+    const s = Math.max(0, Math.floor((Date.now() - since) / 1000))
+    verifyLabel.textContent = `Verifying — waiting for Helios (${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')})`
+  }
+  if (checkpointWarningShown) return   // the checkpoint warning explains the wait itself
+  verifyBadge.className = 'syncing'
+  verifyIcon.textContent = '⟳'
+  verifyBadge.title = `${detail}. Verification keeps trying while this page is open.`
+  tick()
+  heliosWaitTimer = setInterval(tick, 1000)
+}
+function stopHeliosWait() {
+  clearInterval(heliosWaitTimer)
+  heliosWaitTimer = undefined
+  verifyBadge.title = ''
+}
 
 // Terms-of-Use gate: until the user accepts on the onboarding page, Verum loads
 // nothing — redirect there instead of rendering any content.
@@ -893,6 +920,7 @@ window.addEventListener('hashchange', () => {
 
 async function navigate(web3Url: string, attempt = 0) {
   const navToken = ++navSeq
+  stopHeliosWait()
 
   // Hide stale website content immediately — before any await — so the old website
   // never flashes through while storage is read or content arrives fast (local mode).
@@ -914,6 +942,7 @@ async function navigate(web3Url: string, attempt = 0) {
     parsedUrl = parseWeb3URL(web3Url, defaultChain)
     currentChainId = parsedUrl.chainId
     activeChainId = currentChainId
+    void loadCheckpointInfo(currentChainId)
     dappSeen = false
     updateChainChip()
     // Host-only base for rewriting a website's self-referential share links (it builds them
@@ -987,7 +1016,10 @@ async function navigate(web3Url: string, attempt = 0) {
           renderContent(new Uint8Array(msg.assembled), msg.contentType)
         }
         resolve()  // page shown — keep port open for verification update
+      } else if (msg.type === 'verification-progress') {
+        showHeliosWait(msg.since, msg.detail)
       } else if (msg.type === 'verification-update') {
+        stopHeliosWait()
         lastVerification = msg
         applyVerification(msg)
       }
@@ -1008,10 +1040,150 @@ async function navigate(web3Url: string, attempt = 0) {
 }
 
 // ---------------------------------------------------------------------------
+// Light-client checkpoint confirmation
+//
+// When fewer than half of the sources agree on the checkpoint Helios started from (or no checkpoint-sync server
+// confirmed it), the verified badge turns into a persistent "verify manually" warning. Clicking it lists the
+// checkpoints the sources report so the user can pick the one they trust (see background 'choose-checkpoint').
+// ---------------------------------------------------------------------------
+
+let badgeHideTimer: ReturnType<typeof setTimeout> | undefined
+let checkpointInfo: CheckpointInfo | undefined
+let checkpointWarningShown = false
+
+async function loadCheckpointInfo(chainId: number) {
+  const key = checkpointInfoKey(chainId)
+  checkpointInfo = (await chrome.storage.local.get(key).catch(() => ({})) as Record<string, unknown>)[key] as CheckpointInfo | undefined
+  applyCheckpointWarning()
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !currentChainId) return
+  const key = checkpointInfoKey(currentChainId)
+  if (!(key in changes)) return
+  checkpointInfo = changes[key].newValue as CheckpointInfo | undefined
+  applyCheckpointWarning()
+})
+
+function applyCheckpointWarning() {
+  const needs = !!checkpointInfo?.root && checkpointInfo.chainId === currentChainId && !currentLocalMode &&
+    checkpointCheckState(checkpointInfo) === 'needs-check'
+  if (!needs) {
+    // Confirmed in the meantime: put the ordinary verification badge back (or "Verifying…" while the background,
+    // which waited for this confirmation, now runs the verification).
+    if (checkpointWarningShown && lastVerification) applyVerificationBadge(lastVerification)
+    else if (checkpointWarningShown) {
+      checkpointWarningShown = false
+      verifyBadge.className = 'syncing'
+      verifyIcon.textContent = '⟳'
+      verifyLabel.textContent = 'Verifying…'
+      verifyBadge.title = ''
+    }
+    return
+  }
+  // Over a successful verification, or while the verification is still waiting (the background holds it until the
+  // checkpoint is confirmed). A failure badge says more and stays as it is.
+  const waiting = !lastVerification && /\bsyncing\b/.test(verifyBadge.className)
+  if (!waiting && (!lastVerification || !/\b(verified|beacon|portal)\b/.test(verifyBadge.className))) return
+  const { match, answered } = checkpointAgreement(checkpointInfo!)
+  clearTimeout(badgeHideTimer)
+  verifyBadge.className = 'failed cp-warn'
+  verifyIcon.textContent = '⚠'
+  verifyLabel.textContent = answered > match   // some source reports a different hash
+    ? 'Checkpoint disagreement — verify manually'
+    : 'Checkpoint unconfirmed — verify manually'
+  verifyBadge.title = 'Click to choose the checkpoint you trust'
+  checkpointWarningShown = true
+  // Not verified until the checkpoint is: keep the click-to-continue gate on pages that run scripts.
+  const contentLabel = renderMode === 'raw' ? 'file' : 'website'
+  unverifiedModalMsg.textContent = `This ${contentLabel} was checked against a light-client checkpoint that is not confirmed yet. ` +
+    'Confirm the checkpoint (bottom left) or continue at your own risk.'
+  unverifiedGate.classList.toggle('hidden', !pageHasScripts && renderMode !== 'raw')
+}
+
+verifyBadge.addEventListener('click', () => {
+  if (verifyBadge.classList.contains('cp-warn') && checkpointInfo) openCheckpointDialog(checkpointInfo)
+})
+
+function openCheckpointDialog(info: CheckpointInfo) {
+  document.getElementById('cp-dialog')?.remove()
+  const el = (tag: string, cls?: string, text?: string) => {
+    const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e
+  }
+  const wrap = el('div'); wrap.id = 'cp-dialog'
+  const backdrop = el('div', 'cp-dialog-backdrop')
+  const box = el('div', 'cp-dialog-box')
+  box.append(
+    el('h3', '', 'Choose the checkpoint you trust'),
+    el('p', 'cp-dialog-text', 'Compare the hashes with a source you trust — your own beacon node, a block explorer or a ' +
+      'checkpoint sync server — and select the right one.'),
+  )
+  const list = el('div', 'cp-dialog-list')
+  // Every candidate is a root for the same slot: shown on each row so it can be looked up directly.
+  let selected: string | null = null
+  const confirm = el('button', 'cp-dialog-confirm', 'Use selected checkpoint') as HTMLButtonElement
+  confirm.disabled = true
+  for (const c of checkpointCandidates(info)) {
+    // A row, not a <button>: its hash, slot and epoch must be selectable for comparing. Each has a Copy button.
+    const opt = el('div', 'cp-dialog-option')
+    opt.setAttribute('role', 'radio')
+    opt.tabIndex = 0
+    const hashRow = el('div', 'cp-dialog-hashrow')
+    hashRow.append(selectable(c.root, 'cp-dialog-hash'), copyButton(c.root, 'checkpoint hash'))
+    const meta = el('div', 'cp-dialog-meta')
+    if (info.slot !== null) {
+      meta.append('Epoch ', selectable(String(info.epoch)), copyButton(String(info.epoch), 'epoch'),
+        ' · slot ', selectable(String(info.slot)), copyButton(String(info.slot), 'slot'), ' · ')
+    }
+    meta.append(`${c.reportedBy.length} source${c.reportedBy.length === 1 ? '' : 's'}: ${c.reportedBy.join(', ') || '—'}` +
+      `${c.inUse ? ' · in use now' : ''}`)
+    opt.append(hashRow, meta)
+    opt.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); opt.click() } })
+    opt.addEventListener('click', () => {
+      if (selectingText()) return   // the user is selecting text to copy, not choosing
+      list.querySelectorAll('.cp-dialog-option').forEach(o => o.classList.remove('selected'))
+      opt.classList.add('selected')
+      selected = c.root
+      confirm.disabled = false
+    })
+    list.append(opt)
+  }
+  const cancel = el('button', 'cp-dialog-cancel', 'Cancel')
+  const close = () => wrap.remove()
+  cancel.addEventListener('click', close)
+  backdrop.addEventListener('click', close)
+  confirm.addEventListener('click', () => {
+    if (!selected) return
+    confirm.disabled = true
+    confirm.textContent = 'Applying…'
+    chrome.runtime.sendMessage({ type: 'choose-checkpoint', chainId: info.chainId, root: selected })
+      .then((r: { restarted?: boolean } | undefined) => {
+        if (r?.restarted) { verifyLabel.textContent = 'Restarting the light client from the chosen checkpoint…' }
+      })
+      .catch(() => {})
+      .finally(close)
+  })
+  const actions = el('div', 'cp-dialog-actions')
+  actions.append(cancel, confirm)
+  box.append(list, actions)
+  wrap.append(backdrop, box)
+  document.body.append(wrap)
+}
+
+// ---------------------------------------------------------------------------
 // Verification update (arrives via port after Helios syncs)
 // ---------------------------------------------------------------------------
 
+// Verification badge, then the checkpoint warning on top of it when the checkpoint needs the user's confirmation.
 function applyVerification(msg: VerificationUpdate) {
+  applyVerificationBadge(msg)
+  applyCheckpointWarning()
+}
+
+function applyVerificationBadge(msg: VerificationUpdate) {
+  checkpointWarningShown = false
+  verifyBadge.classList.remove('cp-warn')
+  verifyBadge.title = ''
   let isEnsTarget = false
   try { isEnsTarget = parseWeb3URL(msg.proof.url).target.type === 'ens' } catch {}
 
@@ -1020,7 +1192,8 @@ function applyVerification(msg: VerificationUpdate) {
     verifyBadge.className = cls
     verifyIcon.textContent = '✓'
     verifyLabel.textContent = label
-    setTimeout(() => verifyBadge.classList.add('hidden'), delay)
+    clearTimeout(badgeHideTimer)
+    badgeHideTimer = setTimeout(() => verifyBadge.classList.add('hidden'), delay)
     unverifiedGate.classList.add('hidden')
   }
   if (msg.localMode) {
@@ -1033,14 +1206,16 @@ function applyVerification(msg: VerificationUpdate) {
 
   // Helios failing to load or sync is an ERROR in its own right: nothing was checked, so it must not read as
   // "name not confirmed" (which implies a check that came back inconclusive).
-  const heliosErrorText = (why: string) => `Helios failed to load: ${why}. The content could not be verified.`
+  // Error messages may already end in a period; end every sentence with exactly one.
+  const heliosErrorText = (why: string) => `Helios failed to load: ${why.replace(/[.\s]+$/, '')}. The content could not be verified.`
+  const heliosErrorLabel = 'Helios error — could not verify'
 
   if (isEnsTarget && msg.ensVerified !== true) {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
     verifyLabel.textContent = msg.ensVerified === false
       ? 'Name forged — record differs from Helios'
-      : msg.heliosError ? 'Helios error — could not verify'
+      : msg.heliosError ? heliosErrorLabel
       : 'Unverified — Name not confirmed by Helios'
     if (msg.ensVerified === false) {
       warningText.textContent = 'Name record mismatch — the RPC returned a different record than Helios confirmed. This may indicate a compromised RPC endpoint.'
@@ -1063,7 +1238,7 @@ function applyVerification(msg: VerificationUpdate) {
   } else {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
-    verifyLabel.textContent = msg.heliosError ? 'Helios error — could not verify' : 'Unverified — RPC trusted without proof'
+    verifyLabel.textContent = msg.heliosError ? heliosErrorLabel : 'Unverified — RPC trusted without proof'
     warningText.textContent = msg.heliosError
       ? heliosErrorText(msg.heliosError)
       : 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'

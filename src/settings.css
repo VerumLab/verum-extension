@@ -227,6 +227,8 @@ main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; 
 .chain-card.local-mode .toggle-thumb { transform: translateX(16px); background: #fff; }
 .chain-card.local-mode .execution-list .rpc-row:nth-child(n+2) { display: none; }
 .chain-card.local-mode .consensus-list .rpc-row:nth-child(n+2) { display: none; }
+/* Local node mode trusts the user's own node, no light client runs, so there is no checkpoint to show. */
+.chain-card.local-mode .cp-group { display: none; }
 .chain-card.local-mode .execution-list + .add-rpc { display: none; }
 .chain-card.local-mode .consensus-list + .add-rpc { display: none; }
 .chain-card.local-mode .reset-chain { display: none; }
@@ -234,3 +236,40 @@ main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; 
 .chain-card.local-mode .era-group { display: none; }
 .chain-card.local-mode .parquet-group { display: none; }
 .chain-card.local-mode .batch-size { display: none; }
+
+/* Light-client checkpoint status */
+.cp-status .cp-hashrow { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 4px; }
+.cp-status .cp-root {
+  flex: 1; cursor: pointer; user-select: text; font-family: monospace; font-size: 12px; word-break: break-all;
+  color: var(--accent);
+}
+.cp-status .cp-root:hover { text-decoration: underline; }
+.cp-status .cp-drop {
+  margin-top: 6px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+}
+.cp-status .cp-drop > div { padding: 2px 0; }
+.cp-status .cp-drop > div + div { border-top: 1px solid var(--border); }
+.cp-status .cp-line { font-size: 12px; color: var(--text-muted); }
+.cp-status .cp-src  { font-size: 11px; font-family: monospace; color: var(--text-muted); }
+.cp-status .cp-ok, .cp-status .cp-root.cp-ok { color: var(--green); }
+.cp-status .cp-bad  { color: var(--red); }
+.cp-status .cp-ask { display: flex; align-items: center; gap: 8px; margin: 2px 0 6px; font-size: 12px; }
+.cp-status .cp-todo { color: var(--accent); }
+.cp-status .cp-confirm {
+  font: inherit; font-size: 11px; cursor: pointer; color: var(--accent); background: transparent;
+  border: 1px solid var(--accent); border-radius: 10px; padding: 1px 8px;
+}
+.cp-status .cp-recheck { font-variant-numeric: tabular-nums; }
+.cp-status .cp-src { display: flex; justify-content: space-between; gap: 12px; }
+.cp-status .cp-src-what { text-align: right; white-space: nowrap; }
+.cp-status .cp-reset {
+  margin-top: 6px; font: inherit; font-size: 11px; cursor: pointer; color: var(--red); background: transparent;
+  border: 1px solid var(--red); border-radius: 10px; padding: 2px 10px;
+}
+.cp-status .cp-reset:disabled { opacity: 0.6; cursor: default; }
+.cp-status .selectable { user-select: text; font-family: monospace; color: var(--text); }
+.cp-status .copy-btn {
+  font: inherit; font-size: 10px; cursor: pointer; color: var(--text-muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 6px; padding: 0 5px; margin: 0 4px; flex-shrink: 0;
+}
+.cp-status .copy-btn:hover { color: var(--text); }

@@ -6,6 +6,7 @@
 // concatenated bytes from request() and html(). Nothing in it can be changed after deployment.
 
 import { AbiCoder } from 'ethers'
+import type { GasSchedule } from './encoder.js'
 
 // Creation bytecode of contracts/src/VerumSite.sol (solc 0.8.26, optimizer 200, cancun, no metadata).
 // Rebuild with `cd contracts && forge build && forge inspect VerumSite bytecode`.
@@ -60,9 +61,38 @@ export const SITE_CREATION_CODE = '0x' +
 /** EIP-170 caps deployed code at 24,576 bytes; one is the 0x00 marker. */
 export const MAX_DATA_BYTES = 24_575
 
+/**
+ * Glamsterdam's code size limit is 64 KiB (EIP-7954), but wallets still refuse initcode over the
+ * EIP-3860 limit of 49,152 bytes, so a slice is held to that: the initcode is the 12-byte prefix,
+ * the 0x00 marker and the slice.
+ */
+export const GLAMSTERDAM_MAX_DATA_BYTES = 49_152 - 13
+
+/** Glamsterdam data contract: base and gas per data byte, measured on Sepolia (see dataContractGas). */
+const GLAMSTERDAM_CREATE_BASE = 212_151n
+const GLAMSTERDAM_CODE_BYTE = 1_559n
+
+/** At most half a block per slice, so it is included without waiting for an empty block. */
+const BLOCK_SHARE = 2n
+
+/**
+ * Bytes of the file per data contract. Before Glamsterdam, the EIP-170 limit. After it, code is state
+ * gas, outside the 2^24 per-transaction cap (EIP-8037), so a slice is bounded by the code size limit
+ * and by a share of the chain's block gas limit. With no block limit known, by the 2^24 execution cap,
+ * which every chain accepts.
+ */
+export function maxDataBytes(schedule: GasSchedule, blockGasLimit: bigint | null): number {
+  if (schedule === 'prague') return MAX_DATA_BYTES
+  const budget = blockGasLimit === null ? 16_777_216n : blockGasLimit / BLOCK_SHARE
+  // The inverse of dataContractGas: base + per byte, plus 10%.
+  const bytes = ((budget * 10n) / 11n - GLAMSTERDAM_CREATE_BASE) / GLAMSTERDAM_CODE_BYTE
+  const cap = BigInt(GLAMSTERDAM_MAX_DATA_BYTES)
+  return Number(bytes < 1n ? 1n : bytes > cap ? cap : bytes)
+}
+
 /** Initcode that deploys `0x00 ++ data` as a contract's runtime code. */
 export function dataContractInitcode(data: Uint8Array): Uint8Array {
-  if (data.length > MAX_DATA_BYTES) throw new Error('data slice exceeds the contract size limit')
+  if (data.length > GLAMSTERDAM_MAX_DATA_BYTES) throw new Error('data slice exceeds the contract size limit')
   const runtimeLen = data.length + 1
   // PUSH2 len · DUP1 · PUSH1 12 · PUSH1 0 · CODECOPY · PUSH1 0 · RETURN   (12 bytes), then the runtime code.
   const prefix = [0x61, runtimeLen >> 8, runtimeLen & 0xff, 0x80, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x00, 0xf3]
@@ -80,16 +110,19 @@ export function siteInitcode(chunkAddresses: string[]): string {
 }
 
 /** Split a file into data-contract slices. */
-export function splitIntoDataContracts(data: Uint8Array): Uint8Array[] {
+export function splitIntoDataContracts(
+  data: Uint8Array, schedule: GasSchedule, blockGasLimit: bigint | null,
+): Uint8Array[] {
+  const size = maxDataBytes(schedule, blockGasLimit)
   const slices: Uint8Array[] = []
-  for (let i = 0; i < data.length; i += MAX_DATA_BYTES) slices.push(data.subarray(i, i + MAX_DATA_BYTES))
+  for (let i = 0; i < data.length; i += size) slices.push(data.subarray(i, i + size))
   return slices.length ? slices : [new Uint8Array(0)]
 }
 
-// Gas for a contract-creation tx: base + creation + calldata + code deposit (200/byte) + execution slack,
-// with a margin so a slightly different client estimate never leaves the tx short. The limit is only a
-// ceiling; unused gas is not charged.
-function createGas(initcode: Uint8Array, depositBytes: number, extra: bigint): bigint {
+// Gas for a contract-creation tx before Glamsterdam: base + creation + calldata + code deposit
+// (200/byte) + execution slack, with a margin so a slightly different client estimate never leaves the
+// tx short. The limit is only a ceiling; unused gas is not charged.
+function pragueCreateGas(initcode: Uint8Array, depositBytes: number, extra: bigint): bigint {
   let zeros = 0n, nonzeros = 0n
   for (const b of initcode) { if (b === 0) zeros++; else nonzeros++ }
   const calldataGas = zeros * 4n + nonzeros * 16n
@@ -100,11 +133,19 @@ function createGas(initcode: Uint8Array, depositBytes: number, extra: bigint): b
   return base + base / 10n + 30000n
 }
 
-export const dataContractGas = (initcode: Uint8Array, dataLen: number) => createGas(initcode, dataLen + 1, 20_000n)
+// Glamsterdam (EIP-8037 state-creation pricing), measured on Sepolia with eth_estimateGas: a data
+// contract costs about 212,151 + 1,559 per data byte, the serving contract about 2,993,180 + 111,642
+// per chunk (a new storage slot each). A 10% margin covers small differences between clients.
+const withMargin = (gas: bigint): bigint => gas + gas / 10n
 
-/** Gas for the serving contract; `chunkCount` storage slots are written (cold SSTORE each) plus the length. */
-export function siteContractGas(initcode: Uint8Array, chunkCount: number): bigint {
-  const runtime = (SITE_CREATION_CODE.length - 2) / 2        // upper bound on the deployed code size
-  return createGas(initcode, runtime, BigInt(chunkCount + 1) * 22_100n + 20_000n)
+export function dataContractGas(initcode: Uint8Array, dataLen: number, schedule: GasSchedule): bigint {
+  if (schedule === 'glamsterdam') return withMargin(GLAMSTERDAM_CREATE_BASE + GLAMSTERDAM_CODE_BYTE * BigInt(dataLen))
+  return pragueCreateGas(initcode, dataLen + 1, 20_000n)
 }
 
+/** Gas for the serving contract; `chunkCount` storage slots are written (cold SSTORE each) plus the length. */
+export function siteContractGas(initcode: Uint8Array, chunkCount: number, schedule: GasSchedule): bigint {
+  if (schedule === 'glamsterdam') return withMargin(2_993_180n + 111_642n * BigInt(chunkCount))
+  const runtime = (SITE_CREATION_CODE.length - 2) / 2        // upper bound on the deployed code size
+  return pragueCreateGas(initcode, runtime, BigInt(chunkCount + 1) * 22_100n + 20_000n)
+}

@@ -357,3 +357,44 @@ html, body {
 }
 
 .hidden { display: none !important; }
+
+/* ---- Checkpoint warning on the verify badge + choose-checkpoint dialog ---- */
+#verify-badge.cp-warn { pointer-events: auto; cursor: pointer; }
+#cp-dialog .cp-dialog-backdrop { position: fixed; inset: 0; z-index: 120; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); }
+#cp-dialog .cp-dialog-box {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 121;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px 26px;
+  width: min(560px, calc(100% - 32px)); max-height: calc(100% - 48px); overflow: auto;
+  display: flex; flex-direction: column; gap: 14px;
+}
+#cp-dialog h3 { font-size: 16px; color: var(--text); }
+#cp-dialog .cp-dialog-text { font-size: 13px; line-height: 1.5; color: var(--text-muted); }
+#cp-dialog .cp-dialog-list { display: flex; flex-direction: column; gap: 8px; }
+#cp-dialog .cp-dialog-option {
+  text-align: left; cursor: pointer; background: transparent; color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+}
+#cp-dialog .cp-dialog-option:hover { border-color: var(--text-muted); }
+#cp-dialog .cp-dialog-option.selected { border-color: var(--accent); background: rgba(88,166,255,0.08); }
+#cp-dialog .cp-dialog-hashrow { display: flex; align-items: flex-start; gap: 8px; }
+#cp-dialog .cp-dialog-hash { flex: 1; font-family: monospace; font-size: 12px; word-break: break-all; color: var(--accent); }
+#cp-dialog .cp-dialog-meta { margin-top: 4px; font-size: 11px; color: var(--text-muted); }
+#cp-dialog .cp-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
+#cp-dialog .cp-dialog-cancel {
+  background: transparent; border: 1px solid var(--border); color: var(--text-muted);
+  border-radius: 8px; padding: 8px 18px; cursor: pointer; font-size: 13px;
+}
+#cp-dialog .cp-dialog-confirm {
+  background: transparent; border: 1px solid var(--accent); color: var(--accent);
+  border-radius: 8px; padding: 8px 18px; cursor: pointer; font-size: 13px; font-weight: 500;
+}
+#cp-dialog .cp-dialog-confirm:disabled { opacity: 0.5; cursor: default; }
+
+/* Selectable values with a Copy button (checkpoint dialog) */
+#cp-dialog .selectable { user-select: text; cursor: text; }
+#cp-dialog .cp-dialog-meta .selectable { font-family: monospace; color: var(--text); }
+#cp-dialog .copy-btn {
+  font: inherit; font-size: 10px; cursor: pointer; color: var(--text-muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 6px; padding: 0 5px; margin: 0 4px; vertical-align: 1px;
+}
+#cp-dialog .copy-btn:hover { color: var(--text); border-color: var(--text-muted); }

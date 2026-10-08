@@ -4,6 +4,7 @@
   --bg: #0d1117; --surface: #161b22; --border: #30363d;
   --text: #c9d1d9; --text-muted: #8b949e;
   --green: #3fb950; --yellow: #d29922; --radius: 8px;
+  --checkpoint: #58a6ff;  /* the extension's accent blue */
 }
 
 body {
@@ -77,3 +78,35 @@ body {
 #settings-btn:hover, #deploy-btn:hover { color: var(--accent); }
 
 .hidden { display: none !important; }
+
+
+/* Checkpoint under the verdict: the hash in the accent blue (draws the eye, not a warning); click for epoch and agreement */
+#verdict { flex-wrap: wrap; }
+#verdict-checkpoint { flex-basis: 100%; margin-top: -2px; padding-left: 30px; }
+#cp-hashrow { display: flex; align-items: flex-start; gap: 6px; }
+#cp-hash {
+  flex: 1; cursor: pointer; user-select: text;
+  font-family: monospace; font-size: 11px; color: var(--checkpoint); word-break: break-all;
+}
+#cp-hash:hover { text-decoration: underline; }
+#cp-hash.cp-hash-checked { color: var(--green); }
+#cp-drop { margin-top: 6px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+#cp-drop > div { font-size: 11px; color: var(--text-muted); padding: 2px 0; }
+#cp-drop > div + div { border-top: 1px solid var(--border); }
+#cp-drop .cp-bad { color: #f85149; }
+#cp-drop .cp-reason { display: flex; justify-content: space-between; gap: 8px; word-break: break-word; }
+#cp-drop .cp-reason-what { text-align: right; }
+#cp-ask { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 11px; }
+#cp-ask .cp-todo { color: var(--checkpoint); white-space: nowrap; }
+#cp-ask .cp-recheck { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+#cp-confirm {
+  font: inherit; font-size: 11px; cursor: pointer; color: var(--checkpoint); background: transparent;
+  border: 1px solid var(--checkpoint); border-radius: 10px; padding: 1px 8px; white-space: nowrap;
+}
+#cp-confirm:hover { background: rgba(88,166,255,0.12); }
+#verdict-checkpoint .selectable { user-select: text; font-family: monospace; color: var(--text); }
+#verdict-checkpoint .copy-btn {
+  font: inherit; font-size: 10px; cursor: pointer; color: var(--text-muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 6px; padding: 0 5px; margin: 0 4px; flex-shrink: 0;
+}
+#verdict-checkpoint .copy-btn:hover { color: var(--text); }

@@ -55,9 +55,9 @@ export interface ChainConfig {
   name: string
   localMode?: boolean                     // use only rpcs[0] at batch 1000, skip era/parquet
   portalRpc?: string                      // optional local Portal Network node (e.g. http://localhost:8545)
-  checkpointUrls?: string[]               // checkpoint sync providers (prepended before built-in defaults)
-  eraFileUrls?: string[]                  // era file base URLs (prepended before built-in defaults)
-  parquetUrls?: string[]                  // xatu parquet base URLs (prepended before built-in defaults)
+  checkpointUrls?: string[]               // checkpoint sync providers; once set (even empty) the only ones used
+  eraFileUrls?: string[]                  // era file base URLs; once set (even empty) the only ones used
+  parquetUrls?: string[]                  // xatu parquet base URLs; once set (even empty) the only ones used
   rpcBatchSizes?: Record<string, number>  // max JSON-RPC batch size per execution RPC URL
   // The inactive RPC set, preserved across the local-mode toggle: when local mode is on
   // these hold the public RPCs (and vice-versa), so editing the active set never touches
@@ -152,6 +152,8 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     },
     checkpointUrls: [
       'https://beacon.hoodi.ethpandaops.io',
+      'https://checkpoint-sync.hoodi.ethpandaops.io',
+      'https://hoodi.checkpoint.sigp.io',
     ],
     eraFileUrls: [
       'https://hoodi.era.nimbus.team',
@@ -215,6 +217,9 @@ export type BgResponse =
   | { type: 'content'; assembled: number[]; contentType: string }
   | { type: 'error'; message: string; ipfs?: boolean }   // ipfs: name is an IPFS site — open its gateway
   | VerificationUpdate
+  // Verification is waiting for Helios (starting, or its head not at the block yet) and keeps trying while the
+  // page is open; `since` is when the wait began, `detail` what it is waiting for.
+  | { type: 'verification-progress'; since: number; detail: string }
 
 export interface VerificationUpdate {
   type: 'verification-update'

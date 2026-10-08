@@ -6,6 +6,7 @@ import { timestampToSlot } from '../verify/beacon-primitives.js'
 export interface IVerifiedRpc {
   request<T>(method: string, params: unknown[], quickFail?: boolean): Promise<T>
   isHeliosBacked(): boolean
+  checkpointRoot?(): string   // Helios-backed only: the checkpoint this instance was started from
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +175,7 @@ function proxyTally(methods: string[], ms: number) {
   }
   if (!_proxyFlush) _proxyFlush = setTimeout(() => {
     const parts = [...(_proxyStats)].map(([m, s]) => `${m}×${s.n} (avg ${Math.round(s.ms / s.n)}ms)`)
-    w3log('[w3] proxy exec /2s:', parts.join(', '))
+    w3log('[w3] proxy /2s:', parts.join(', '))
     _proxyStats.clear(); _proxyFlush = null
   }, 2000)
 }
@@ -326,8 +327,11 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
       // Helios never sees a network error — it just perceives a slow response.
       for (let attempt = 0; attempt < rpcs.length; attempt++) {
         const rpc = rpcs[(startIdx + attempt) % rpcs.length]
-        // A provider recently seen serving stale light-client data is skipped while others remain.
-        if (isCons && attempt < rpcs.length - 1 && (_proxyStale.get(`${proxyKey}|${rpc}`) ?? 0) > Date.now()) continue
+        // A provider recently seen serving stale light-client updates is skipped for those updates while others
+        // remain. Only for the update requests: its other data (bootstrap, headers) can be fine — on Sepolia the
+        // provider with slow updates is the only one that serves bootstraps at all.
+        if (isCons && attempt < rpcs.length - 1 && /\/light_client\/(optimistic_update|finality_update|updates)/.test(path) &&
+            (_proxyStale.get(`${proxyKey}|${rpc}`) ?? 0) > Date.now()) continue
 
         const ctrl = new AbortController()
         // Consensus responses (bootstrap, update batches) can be MBs allow longer.
@@ -344,6 +348,9 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
             return res
           }
           if (isCons) {
+            // Tally which consensus endpoints Helios is polling and from whom, so a frozen head can be told apart
+            // from "Helios stopped asking" in the 2s summary line.
+            proxyTally([`cons ${path.split('?')[0].split('/').slice(-2).join('/')} @${host.split('.')[0]}`], Date.now() - _t0)
             const latest = /\/eth\/v1\/beacon\/light_client\/(optimistic_update|finality_update)(?:$|\?)/.exec(path)
             if (latest) {
               const lag = await lightClientLagSeconds(res, Number(proxyKey.split('-')[2]))
@@ -492,6 +499,9 @@ const HELIOS_NETWORK_BY_CHAIN: Record<number, HeliosNet> = {
   560048:   'hoodi',
   11155111: 'sepolia',
 }
+
+// The Helios network a chain maps to (used e.g. to find its pinned checkpoint).
+export function heliosNetworkFor(chain: ChainConfig): string | undefined { return heliosNetwork(chain) }
 
 // Resolves the Helios preset for a chain, or undefined when Helios can't verify it — so
 // createVerifiedRpc surfaces a clear error instead of silently syncing against the wrong network.

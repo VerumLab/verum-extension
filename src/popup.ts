@@ -1,4 +1,7 @@
+import { copyButton, selectable, selectingText } from './lib/ui/copy-button.js'
 import { AGREEMENT_VERSION } from './types.js'
+import { parseWeb3URL } from './lib/w3/url-parser.js'
+import { checkpointInfoKey, checkpointSourceLines, checkpointSourceRows, checkpointRecheckText, checkpointCheckState, markCheckpointChecked, CHECK_HINT, type CheckpointInfo } from './lib/verify/checkpoint-info.js'
 
 // Terms gate: until the user has accepted, clicking the extension icon just sends them
 // to the onboarding/accept page — the app UI is never shown. Kept hidden until the check
@@ -47,6 +50,9 @@ chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
   if (!tab?.id) return
   const watchKey = `proof_${tab.id}`
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && checkpointKey && checkpointKey in changes) {
+      renderCheckpoint(changes[checkpointKey].newValue as CheckpointInfo | undefined)
+    }
     if (area === 'session' && watchKey in changes) {
       const data = changes[watchKey].newValue
       if (data) showProof(data)
@@ -67,6 +73,110 @@ async function load() {
   showProof(data)
 }
 
+// Light-client checkpoint, under the verdict: the hash Helios started from (so it can be compared by hand), and on
+// click its epoch and how many independent sources agree on it.
+let checkpointKey: string | null = null
+async function showCheckpoint(url: string | undefined, localMode: boolean) {
+  const box = document.getElementById('verdict-checkpoint')!
+  if (!url || localMode) { box.classList.add('hidden'); checkpointKey = null; return }
+  let chainId: number
+  try {
+    const { defaultChain } = await chrome.storage.sync.get('defaultChain')
+    chainId = parseWeb3URL(url, (defaultChain as number | undefined) ?? 1).chainId
+  } catch { box.classList.add('hidden'); return }
+  checkpointKey = checkpointInfoKey(chainId)
+  const info = (await chrome.storage.local.get(checkpointKey))[checkpointKey] as CheckpointInfo | undefined
+  renderCheckpoint(info)
+}
+
+// A verification rests on the light client's checkpoint. While that checkpoint still needs the user's confirmation,
+// a successful verdict is held back ("waiting"); it comes back as soon as the checkpoint is confirmed or chosen.
+let lastProof: any = null
+let verdictHeld = false
+function holdVerdict(hold: boolean) {
+  if (hold && /\b(verified|beacon|portal)\b/.test(verdict.className)) {
+    verdict.className = 'unverified'
+    document.getElementById('verdict-icon')!.textContent = '⏸'
+    document.getElementById('verdict-text')!.textContent = 'Waiting for checkpoint confirmation'
+    verdictHeld = true
+  } else if (!hold && verdictHeld) {
+    verdictHeld = false
+    if (lastProof) showProof(lastProof)
+  }
+}
+
+function renderCheckpoint(info: CheckpointInfo | undefined) {
+  const box = document.getElementById('verdict-checkpoint')!
+  if (!info?.root) { box.classList.add('hidden'); holdVerdict(false); return }
+  const hash = document.getElementById('cp-hash')!
+  hash.textContent = info.root
+  // Copy button next to the hash (replaced on every render).
+  document.querySelector('#cp-hashrow .copy-btn')?.remove()
+  document.getElementById('cp-hashrow')!.append(copyButton(info.root, 'checkpoint hash'))
+  const state = checkpointCheckState(info)
+  hash.classList.toggle('cp-hash-checked', state !== 'needs-check')   // green once confirmed by the sources or checked by the user
+  holdVerdict(state === 'needs-check')
+  shownCheckpoint = { chainId: info.chainId, root: info.root }
+  // Tell the user this hash is theirs to check, until they have.
+  const askText = document.getElementById('cp-ask-text')!
+  const confirm = document.getElementById('cp-confirm')!
+  clearInterval(recheckTimer)
+  // Confirmed by the sources: no line (the agreement in the dropdown says enough).
+  document.getElementById('cp-ask')!.classList.toggle('hidden', state === 'confirmed')
+  if (state !== 'needs-check') {
+    // The green hash says it is confirmed; this counts down to the next checkpoint, which needs a new check.
+    const tick = () => { askText.textContent = checkpointRecheckText(info) }
+    tick()
+    recheckTimer = setInterval(tick, 1000)
+    askText.className = 'cp-recheck'
+    confirm.classList.add('hidden')
+  } else {
+    askText.textContent = 'Check this hash yourself'
+    askText.className = 'cp-todo'
+    confirm.classList.remove('hidden')
+  }
+  askText.title = CHECK_HINT
+  const ok = info.sources.filter(s => s.status === 'match').length
+  const differ = info.sources.filter(s => s.status === 'mismatch').length
+  const epochRow = document.getElementById('cp-epoch')!
+  if (info.epoch !== null && info.slot !== null) {
+    epochRow.replaceChildren('Epoch ', selectable(String(info.epoch)), copyButton(String(info.epoch), 'epoch'),
+      ' · slot ', selectable(String(info.slot)), copyButton(String(info.slot), 'slot'))
+  } else {
+    epochRow.textContent = 'Epoch unknown'
+  }
+  const agree = document.getElementById('cp-agree')!
+  agree.textContent = info.problem ?? `${ok}/${info.sources.length} agree${differ ? ` · ${differ} different` : ''}`
+  agree.classList.toggle('cp-bad', info.verdict === 'disagree')
+  agree.title = checkpointSourceLines(info).join('\n')
+  // One row per source that reports a different hash, with what it reported.
+  const drop = document.getElementById('cp-drop')!
+  drop.querySelectorAll('.cp-reason').forEach(el => el.remove())
+  for (const r of checkpointSourceRows(info)) {
+    if (r.status !== 'mismatch') continue
+    const row = document.createElement('div')
+    row.className = 'cp-reason cp-bad'
+    const who = document.createElement('span'); who.textContent = r.left
+    const what = document.createElement('span'); what.className = 'cp-reason-what'; what.textContent = r.right
+    row.append(who, what)
+    drop.appendChild(row)
+  }
+  box.classList.remove('hidden')
+}
+
+let shownCheckpoint: { chainId: number; root: string } | null = null
+let recheckTimer: ReturnType<typeof setInterval> | undefined
+document.getElementById('cp-confirm')!.addEventListener('click', () => {
+  if (shownCheckpoint) void markCheckpointChecked(shownCheckpoint.chainId, shownCheckpoint.root)
+})
+
+// The hash is selectable text, and a plain click on it opens/closes the details.
+const toggleCheckpointDetails = () => { if (!selectingText()) document.getElementById('cp-drop')!.classList.toggle('hidden') }
+document.getElementById('cp-hash')!.addEventListener('click', toggleCheckpointDetails)
+document.getElementById('cp-hash')!.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); document.getElementById('cp-drop')!.classList.toggle('hidden') }
+})
+
 function showIdle() {
   // No active w3:// page → show only the URL bar + footer (settings/deploy).
   idle.classList.add('hidden')
@@ -74,7 +184,9 @@ function showIdle() {
 }
 
 function showProof(d: any) {
+  lastProof = d
   if (d.url) navInput.value = d.url.replace('w3://', '')
+  void showCheckpoint(d.url, !!d.localMode)
   idle.classList.add('hidden')
   proof.classList.remove('hidden')
 

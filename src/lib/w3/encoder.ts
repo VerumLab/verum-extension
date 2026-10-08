@@ -178,10 +178,28 @@ export async function encodeBundle(files: DeployFile[], maxCalldata = MAX_CALLDA
   return { chunks, rawSize: bundle.length, compressedSize: compressed.length }
 }
 
-// EIP-7623 (Pectra) calldata gas: max(standard, floor) + 21000 base + buffer.
-// Same formula as scripts/publish.js — skips eth_estimateGas, which public
-// RPCs reject for large request bodies.
-export function txGasLimit(calldata: Uint8Array): bigint {
+/** Which gas pricing a chain uses: Glamsterdam repriced calldata and state creation. */
+export type GasSchedule = 'prague' | 'glamsterdam'
+
+/**
+ * Read from the cost of an empty transaction, which the chain computes under its current rules:
+ * 21,000 before Glamsterdam, 15,000 after. Switches by itself when a chain forks.
+ */
+export function scheduleFromEmptyTxGas(gas: bigint): GasSchedule {
+  return gas < 21_000n ? 'glamsterdam' : 'prague'
+}
+
+/**
+ * Gas limit for a calldata transaction. Glamsterdam, measured on Sepolia with eth_estimateGas: 15,000
+ * base and about 64.5 gas per byte, zero or not, plus 10%. Before it, EIP-7623: max(standard, floor) +
+ * 21,000 base + buffer. Same formula as scripts/publish.js — skips eth_estimateGas, which public RPCs
+ * reject for large request bodies.
+ */
+export function txGasLimit(calldata: Uint8Array, schedule: GasSchedule): bigint {
+  if (schedule === 'glamsterdam') {
+    const gas = 15_000n + (BigInt(calldata.length) * 645n) / 10n
+    return gas + gas / 10n
+  }
   let zeros = 0n, nonzeros = 0n
   for (const b of calldata) { if (b === 0) zeros++; else nonzeros++ }
   const standardDataGas = zeros * 4n + nonzeros * 16n

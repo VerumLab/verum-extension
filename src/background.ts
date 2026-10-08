@@ -1,11 +1,14 @@
 import { w3log, initW3Debug } from './lib/log'
 import { parseWeb3URL } from './lib/w3/url-parser.js'
-import { RpcClient, createVerifiedRpc } from './lib/rpc/light-client.js'
+import { RpcClient, createVerifiedRpc, heliosNetworkFor } from './lib/rpc/light-client.js'
+import { checkCheckpoint, checkpointInfoKey, checkpointSources } from './lib/verify/checkpoint-check.js'
+import { CHECKPOINT_REUSE_MS, pinnedCheckpointKey, checkpointCheckState, type CheckpointInfo, type PinnedCheckpoint } from './lib/verify/checkpoint-info.js'
 import { getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/verify/tx-verifier.js'
 import type { RpcBlockFull } from './lib/verify/tx-verifier.js'
 import { getCalldataViaPortal } from './lib/rpc/portal.js'
 import { parseCalldata, assembleContent } from './lib/w3/content.js'
-import { resolveName, nameIsIpfs, reverifyName } from './lib/w3/name-resolver.js'
+import { resolveName, nameIsIpfs, reverifyNameFast } from './lib/w3/name-resolver.js'
+import { checkAtFinalized } from './lib/w3/contract-verify.js'
 import type { TxRef, NameResolution } from './lib/w3/name-resolver.js'
 import { fetchContractContent } from './lib/w3/erc5219.js'
 import { waitForExecutionHead } from './lib/rpc/oos-probe.js'
@@ -38,12 +41,21 @@ async function agreementAccepted(): Promise<boolean> {
 // Lag (seconds behind) at which an OOS instance is considered unrecoverable and
 // the WASM is torn down and re-synced, rather than re-probed in place.
 const OOS_RESTART_LAG_SECONDS = 150
-// A fresh instance starts minutes behind and normally recovers within ~30s; do not call it wedged before this,
-// and give up on the probe after the budget (the exhaustion path then restarts it if it is still stuck).
+// A fresh instance starts minutes behind (it re-anchors from the last finalized checkpoint) and its head does not
+// advance until its next update arrives. Observed: recoveries land at ~380-410s of lag, i.e. about one epoch
+// (384s) after the last finalization, so a cold start can take a couple of minutes. An instance is only called
+// wedged once it is clearly past that point and still not improving, never on its first reading. The probe budget
+// leaves room for a start that is just over the sync guard, which then waits nearly a full epoch.
+const OOS_WEDGE_LAG_SECONDS = 450
 const OOS_WEDGE_GRACE_MS = 90_000
-const OOS_PROBE_BUDGET_MS = 150_000
+const OOS_PROBE_BUDGET_MS = 330_000
 
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
+// chainId → the checkpoint of the Helios instance currently in rpcCache, read from that instance itself. This is the
+// only source for the hash Verum shows, compares and gates verification on, so the hash shown is always the one the
+// verifying instance started from. Set when its start succeeds, cleared when it is evicted.
+const activeCheckpoint = new Map<number, string>()
+const usedCheckpointFor = (chain: ChainConfig): string | undefined => activeCheckpoint.get(chain.chainId)
 
 // Removes a chain's WASM instance from the cache AND shuts it down. Deleting
 // the cache entry alone leaks the instance: its internal polling loops keep
@@ -51,6 +63,7 @@ const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
 function evictChainRpc(chainId: number) {
   const old = rpcCache.get(chainId)
   rpcCache.delete(chainId)
+  activeCheckpoint.delete(chainId)
   old?.then(rpc => (rpc as { shutdown?: () => Promise<void> }).shutdown?.().catch(() => {})).catch(() => {})
 }
 
@@ -215,12 +228,19 @@ function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       // allowing a retry — clearing immediately causes a tight hammering loop
       // that worsens 429s and keeps the page stuck on loading.
       setTimeout(() => {
-        rpcCache.delete(chain.chainId)
+        if (rpcCache.get(chain.chainId) === p) { rpcCache.delete(chain.chainId); activeCheckpoint.delete(chain.chainId) }
         freshRpcCache.delete(chain.chainId)
         freshRpcReady.delete(chain.chainId)
       }, 60_000)
     })
     rpcCache.set(chain.chainId, p)
+    p.then((rpc) => {
+      if (rpcCache.get(chain.chainId) !== p) return   // replaced meanwhile: that instance's start records its own
+      const root = rpc.checkpointRoot?.()
+      if (root) activeCheckpoint.set(chain.chainId, root)
+      else activeCheckpoint.delete(chain.chainId)
+      return recordCheckpoint(chain)
+    }).catch(() => {})
     // The fresh instance (OOS probe + keepalive restarts) exists only to serve website
     // eth_call reads. It is NOT spawned here: a static page needs Helios once, to
     // verify its calldata, and then nothing more — spawning the fresh probe for it
@@ -232,6 +252,137 @@ function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
   return rpcCache.get(chain.chainId)!
 }
 
+// After every Helios start: compare the checkpoint it synced from with all consensus RPCs and public checkpoint-sync
+// servers, and keep the result (with the full hash) for the popup and settings, so it can also be checked by hand.
+async function recordCheckpoint(chain: ChainConfig) {
+  const root = usedCheckpointFor(chain)
+  if (root === undefined) return
+  const key = checkpointInfoKey(chain.chainId)
+  const previous = (await chrome.storage.local.get(key).catch(() => ({})) as Record<string, unknown>)[key] as CheckpointInfo | undefined
+  const sameRoot = !!previous && previous.root === root
+  // The checkpoint is pinned for a day: while it is unchanged, keep its comparison (and the user's own check of it)
+  // instead of asking every source again on each Helios restart.
+  // ...unless the sources changed in settings since then (e.g. checkpoint sync URLs removed or added).
+  const norm = (u: string) => u.replace(/\/$/, '').toLowerCase()
+  const sourcesNow = checkpointSources(chain).map(s => norm(s.url)).sort().join('|')
+  const sourcesThen = (previous?.sources ?? []).map(s => norm(s.url)).sort().join('|')
+  if (sameRoot && sourcesNow === sourcesThen && Date.now() - previous!.checkedAt < CHECKPOINT_REUSE_MS &&
+      !previous!.sources.some(s => s.status === 'behind')) return
+  const startedAt = Date.now()
+  const adoptedAt = sameRoot ? previous!.adoptedAt : startedAt
+  // A checkpoint the user picked themselves (from the disagreement dialog) is confirmed by them.
+  const network = heliosNetworkFor(chain)
+  const pin = network
+    ? (await chrome.storage.local.get(pinnedCheckpointKey(network)).catch(() => ({})) as Record<string, unknown>)[pinnedCheckpointKey(network)] as PinnedCheckpoint | undefined
+    : undefined
+  const chosenAt = pin?.userChosen && pin.root === root ? pin.adoptedAt : undefined
+  const run = async () => {
+    const info: CheckpointInfo = {
+      ...(await checkCheckpoint(chain, root, startedAt, adoptedAt)),
+      ...(sameRoot && previous!.userCheckedAt ? { userCheckedAt: previous!.userCheckedAt } : {}),
+      ...(chosenAt ? { userCheckedAt: chosenAt } : {}),
+    }
+    // Keep a check the user made in the meantime (e.g. while this comparison was running).
+    const now = (await chrome.storage.local.get(key).catch(() => ({})) as Record<string, unknown>)[key] as CheckpointInfo | undefined
+    if (now?.root === root && now.userCheckedAt) info.userCheckedAt = now.userCheckedAt
+    await chrome.storage.local.set({ [key]: info }).catch(() => {})
+    const ok = info.sources.filter(s => s.status === 'match').length
+    if (info.verdict === 'disagree') {
+      console.warn(`[w3] Helios checkpoint ${root} (chain ${chain.chainId}) — sources DISAGREE:`,
+        info.sources.filter(s => s.status === 'mismatch').map(s => `${s.url} reports ${s.root}`).join('; '))
+    } else {
+      w3log(`[w3] Helios checkpoint ${root ?? '(built-in)'} slot ${info.slot}: ${ok}/${info.sources.length} sources agree`)
+    }
+    return info
+  }
+  const info = await run()
+  // Sources that are behind (checkpoint-sync servers lag by up to an epoch): check once more after they caught up.
+  if (info.sources.some(s => s.status === 'behind')) {
+    setTimeout(() => { if (usedCheckpointFor(chain) === root) void run().catch(() => {}) }, 7 * 60_000)
+  }
+}
+
+// Verification rests on the checkpoint Helios started from, so it does not run until that checkpoint is settled:
+// confirmed automatically by the sources, confirmed by the user, or replaced by one the user chose (which restarts
+// Helios). Meanwhile the viewer shows "Checkpoint … — verify manually" (from storage) and the result is held back.
+// Resolves as soon as it is settled; also when Helios cannot start at all (the verification then reports that).
+async function waitForConfirmedCheckpoint(chain: ChainConfig, shouldAbort: () => boolean): Promise<void> {
+  if (chain.localMode) return
+  const key = checkpointInfoKey(chain.chainId)
+  let announced = false
+  for (;;) {
+    if (shouldAbort()) return
+    try { await getOrCreateRpc(chain) } catch { return }       // no Helios: nothing to confirm; verification says why
+    const root = usedCheckpointFor(chain)
+    if (!root) { await new Promise(r => setTimeout(r, 1_000)); continue }   // instance being replaced: wait for the new one
+    const info = (await chrome.storage.local.get(key).catch(() => ({})) as Record<string, unknown>)[key] as CheckpointInfo | undefined
+    if (info?.root === root && checkpointCheckState(info) !== 'needs-check') return
+    if (info?.root === root && !announced) {
+      announced = true
+      w3log(`[w3] Verification waits for the checkpoint ${root} to be confirmed (chain ${chain.chainId})`)
+    }
+    // Woken by a storage change (comparison finished, user confirmed/chose), or re-checked every few seconds.
+    await new Promise<void>((resolve) => {
+      const done = () => { chrome.storage.onChanged.removeListener(onChange); clearTimeout(timer); resolve() }
+      const onChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => { if (area === 'local' && key in changes) done() }
+      chrome.storage.onChanged.addListener(onChange)
+      const timer = setTimeout(done, 5_000)
+    })
+  }
+}
+
+// The last check before Helios verifies anything: the instance doing the verification must have started from exactly
+// the checkpoint that is shown (stored) and confirmed. Never verifies on any other root (e.g. a restart that adopted a
+// new checkpoint after the one shown was confirmed).
+async function assertShownCheckpoint(chain: ChainConfig, rpc: IVerifiedRpc): Promise<void> {
+  if (chain.localMode) return
+  const root = rpc.checkpointRoot?.()
+  if (!root) throw new Error('Helios instance has no checkpoint — verification refused')
+  const key = checkpointInfoKey(chain.chainId)
+  const info = (await chrome.storage.local.get(key).catch(() => ({})) as Record<string, unknown>)[key] as CheckpointInfo | undefined
+  if (info?.root?.toLowerCase() !== root.toLowerCase())
+    throw new Error(`Helios runs on checkpoint ${root}, but the checkpoint shown is ${info?.root ?? 'none'} — verification refused. Reload to check the new checkpoint.`)
+  if (checkpointCheckState(info) === 'needs-check')
+    throw new Error(`Checkpoint ${root} is not confirmed — verification refused`)
+}
+
+// The user checked the checkpoint in use ("I checked it" in the popup or settings): pin exactly that root for a day,
+// so Helios restarts from it instead of a fresh root that would need checking again (see HeliosWasmClient.create).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return
+  for (const [key, change] of Object.entries(changes)) {
+    if (!key.startsWith('checkpoint_info_')) continue
+    const info = change.newValue as CheckpointInfo | undefined
+    const before = change.oldValue as CheckpointInfo | undefined
+    if (!info?.root || !info.userCheckedAt) continue
+    if (before?.root === info.root && before.userCheckedAt === info.userCheckedAt) continue   // nothing new checked
+    const chain = { chainId: info.chainId } as ChainConfig
+    const network = heliosNetworkFor(chain)
+    if (!network) continue
+    const pinKey = pinnedCheckpointKey(network)
+    void chrome.storage.local.get(pinKey).then((got) => {
+      const pin = got[pinKey] as PinnedCheckpoint | undefined
+      if (pin?.userChosen && pin.root === info.root) return   // already pinned (chosen, or checked before)
+      return chrome.storage.local.set({ [pinKey]: { root: info.root!, adoptedAt: info.userCheckedAt!, userChosen: true } satisfies PinnedCheckpoint })
+    }).catch(() => {})
+  }
+})
+
+// Settings changed a chain's consensus RPCs or checkpoint sync URLs (edited, removed, or "Reset"): compare the checkpoint
+// in use again right away, against the new sources, instead of only at the next Helios start. recordCheckpoint sees
+// that the sources differ from the stored result and recomputes; the popup, settings and viewer update from storage.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'sync' || !changes.chains) return
+  const before = (changes.chains.oldValue ?? {}) as Record<number, ChainConfig>
+  const after = (changes.chains.newValue ?? {}) as Record<number, ChainConfig>
+  const sources = (c?: ChainConfig) => c ? JSON.stringify([c.consensusRpcs ?? [], c.checkpointUrls ?? []]) : ''
+  for (const [id, chain] of Object.entries(after)) {
+    if (chain.localMode || sources(before[Number(id)]) === sources(chain)) continue
+    if (usedCheckpointFor(chain) === undefined) continue   // no Helios start yet: the next one runs the check
+    void recordCheckpoint(chain).catch(() => {})
+  }
+})
+
 // Fresh Helios cache — resolves after the base is ready AND a new block has
 // been observed, resetting drift to near-zero. Used by ethRpcCall so website
 // eth_call reads land on Helios well within the out-of-sync threshold.
@@ -241,7 +392,7 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       // Wait for the execution head to get past the out-of-sync guard. A new instance starts minutes behind
       // and normally catches up by itself, so it is only restarted when it is not recovering (see oos-probe.ts).
       const res = await waitForExecutionHead(() => rpc.request<string>('eth_blockNumber', [], true), {  // quickFail — skip internal 3s retry
-        wedgeLag: OOS_RESTART_LAG_SECONDS,
+        wedgeLag: OOS_WEDGE_LAG_SECONDS,
         graceMs: OOS_WEDGE_GRACE_MS,
         budgetMs: OOS_PROBE_BUDGET_MS,
         onWaiting: (s, lag) => w3log(`[w3] Helios OOS probe still waiting (${s}s, ${lag}s behind)…`),
@@ -496,6 +647,10 @@ async function twoPhaseResolve(
   const gen = tabId !== undefined ? (tabVerGen.get(tabId) ?? 0) + 1 : 0
   if (tabId !== undefined) tabVerGen.set(tabId, gen)
   const isSuperseded = () => tabId !== undefined && tabVerGen.get(tabId) !== gen
+  // The page closed its port (tab closed, navigated, or the deploy page gave up): nothing is waiting for the result.
+  let portClosed = false
+  port.onDisconnect.addListener(() => { portClosed = true })
+  const pageGone = () => portClosed || isSuperseded()
   const stored = await chrome.storage.sync.get(['chains', 'defaultChain'])
   const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
   const defaultChain = (stored.defaultChain as number | undefined) ?? 1
@@ -541,7 +696,7 @@ async function twoPhaseResolve(
   let preResolvedChunks: TxRef[] | undefined
   // Raw contract address (web3://0x…): no name resolution — serve the contract directly.
   if (parsed.target.type === 'contract') {
-    await resolveContractServed(rawUrl, tabId, port, send, parsed, chains, { address: parsed.target.address }, isSuperseded)
+    await resolveContractServed(rawUrl, tabId, port, send, parsed, chains, { address: parsed.target.address }, pageGone)
     return
   }
   if (parsed.target.type === 'ens') {
@@ -558,7 +713,7 @@ async function twoPhaseResolve(
       return
     }
     if (resolution.kind === 'contract') {
-      await resolveContractServed(rawUrl, tabId, port, send, parsed, chains, resolution, isSuperseded)
+      await resolveContractServed(rawUrl, tabId, port, send, parsed, chains, resolution, pageGone)
       return
     }
     preResolvedChunks = resolution.chunks
@@ -663,7 +818,7 @@ async function twoPhaseResolve(
       const portalHeliosRpc = await portalHeliosPromise
       w3log('[w3] Mode 3 — ENS/GNS re-verification: helios rpc ready:', !!portalHeliosRpc, 'heliosBacked:', portalHeliosRpc?.isHeliosBacked())
       if (portalHeliosRpc?.isHeliosBacked() && parsed.target.type === 'ens') {
-        ensVerified = await reverifyName(parsed.target.name, portalHeliosRpc, phase1EnsChunks)
+        ensVerified = await reverifyNameFast(parsed.target.name, portalHeliosRpc, phase1EnsChunks)
         w3log('[w3] Mode 3 — ENS/GNS re-verification result:', ensVerified)
       }
 
@@ -712,6 +867,10 @@ async function twoPhaseResolve(
     port.disconnect()
     return
   }
+
+  // Helios-based verification (Mode 1 / Mode 2) waits until its checkpoint is confirmed.
+  await waitForConfirmedCheckpoint(chain, isSuperseded)
+  if (isSuperseded()) { port.disconnect(); return }
 
   // Historical blocks (> ~27h old) are outside the EIP-2935 ring buffer — Helios
   // would only throw EIP-2935 for them anyway. Skip the expensive multi-combo
@@ -821,7 +980,7 @@ async function twoPhaseResolve(
       // heliosPromise is already settled — verifyViaBeacon awaited it internally
       const historicalHeliosRpc = await heliosPromise
       if (historicalHeliosRpc?.isHeliosBacked() && parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
-        ensVerified = await reverifyName(parsed.target.name, historicalHeliosRpc, phase1EnsChunks)
+        ensVerified = await reverifyNameFast(parsed.target.name, historicalHeliosRpc, phase1EnsChunks)
         w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
       }
       update = {
@@ -872,25 +1031,43 @@ async function twoPhaseResolve(
   let heliosRpc: Awaited<ReturnType<typeof getOrCreateRpc>> | undefined
   // Set when Helios itself could not be loaded/synced; reported as an error, never as "name not confirmed".
   let heliosFailure: string | undefined
+  // A block NEWER than Helios's head (a fresh deployment while Helios's head trails, e.g. a cold start or a consensus
+  // RPC that publishes finality updates only once per epoch) also fails with "outside EIP-2935 ring buffer range
+  // (latest: N)". That is not a historical block — Mode 2 can't verify a block past the finalized state either.
+  const aheadOfHead = (e: unknown) => {
+    const m = /block (\d+) is outside EIP-2935 ring buffer range \(latest: (\d+)/.exec((e as Error)?.message ?? '')
+    return !!m && Number(m[1]) > Number(m[2])
+  }
 
   try {
     // Keep the rejection reason — swallowing it left "Helios not available" as
     // the only clue for genuinely different failures (bootstrap 404, dead exec
     // RPC, rate limit), which is not enough to act on.
-    let heliosInitErr: string | undefined
-    heliosRpc = await Promise.race([
-      getOrCreateRpc(chain).catch((e: unknown) => {
-        heliosInitErr = (e as Error).message
-        return undefined
-      }),
-      new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
-    ])
-    if (!heliosRpc) {
-      throw new Error(heliosInitErr
-        ? `Helios init failed — ${heliosInitErr}`
-        : 'Helios not available (35s timeout — still syncing or consensus RPC unreachable)')
+    //
+    // Helios that can't start yet, or whose head is behind the block, is waited for as long as the page is open
+    // (no deadline, no retry button): the viewer shows how long it has been trying. Only a superseded/closed page
+    // or a non-recoverable error ends the wait.
+    const heliosWaitStart = Date.now()
+    const progress = (detail: string) => send({ type: 'verification-progress', since: heliosWaitStart, detail })
+    const acquireHelios = async (): Promise<IVerifiedRpc> => {
+      for (let announced = false; ;) {
+        let initErr: string | undefined
+        const rpc = await Promise.race([
+          getOrCreateRpc(chain).catch((e: unknown) => { initErr = (e as Error).message; return undefined }),
+          new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
+        ])
+        if (rpc) return rpc
+        if (pageGone()) throw new Error(SUPERSEDED)
+        const why = initErr ? `Helios init failed — ${initErr}` : 'Helios still syncing (consensus RPC slow or unreachable)'
+        if (initErr && /not a Helios-supported network/.test(initErr)) throw new Error(why)   // will never start
+        if (!announced) { announced = true; w3log(`[w3] Mode 1 — ${why}; retrying until it starts…`) }
+        progress(why)
+        await new Promise(r => setTimeout(r, 10_000))   // a failed start is held for 60s (getOrCreateRpc), then retried
+      }
     }
+    heliosRpc = await acquireHelios()
     w3log('[w3] Mode 1 — got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
+    try { await assertShownCheckpoint(chain, heliosRpc) } catch (e) { heliosFailure = (e as Error).message; throw e }
     // Verify EVERY chunk through Helios and bind the phase-1 rendered bytes to the
     // Helios-verified calldata. Without the byte comparison, a fast RPC serving a
     // self-consistent forgery in phase 1 would render forged content while phase 2
@@ -898,14 +1075,37 @@ async function twoPhaseResolve(
     let result!: Awaited<ReturnType<typeof getVerifiedCalldataByLocation>>
     for (let i = 0; i < phase1Results.length; i++) {
       const p1 = phase1Results[i]
-      result = await getVerifiedCalldataByLocation(p1.blockNumber, p1.txIndex, heliosRpc)
+      for (let announced = false; ;) {
+        try {
+          result = await getVerifiedCalldataByLocation(p1.blockNumber, p1.txIndex, heliosRpc)
+          break
+        } catch (e) {
+          if (pageGone()) throw new Error(SUPERSEDED)
+          if (aheadOfHead(e)) {
+            const m = /\(latest: (\d+)/.exec((e as Error).message)
+            if (!announced) {
+              announced = true
+              w3log(`[w3] Mode 1 — block ${p1.blockNumber} is newer than Helios's head; waiting for the head to reach it…`)
+            }
+            progress(`Helios's verified head (block ${m?.[1] ?? '?'}) has not reached block ${p1.blockNumber} yet`)
+            await new Promise(r => setTimeout(r, 6_000))
+            continue
+          }
+          // The instance was replaced meanwhile (watchdog restart): continue on the new one.
+          const current = await rpcCache.get(chain.chainId)?.catch(() => undefined)
+          if (current === heliosRpc) throw e
+          w3log('[w3] Mode 1 — Helios was restarted while waiting; continuing on the new instance')
+          heliosRpc = await acquireHelios()
+          try { await assertShownCheckpoint(chain, heliosRpc) } catch (e2) { heliosFailure = (e2 as Error).message; throw e2 }
+        }
+      }
       if (!bytesEqual(result.calldata, p1.calldata))
         throw new Error(`Rendered calldata mismatch: chunk ${i} (block ${p1.blockNumber}, tx ${p1.txIndex}) does not match Helios-verified calldata`)
     }
     w3log(`[w3] Mode 1 — render binding: ${phase1Results.length} chunk(s) verified, rendered bytes match Helios ✓`)
 
     if (parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
-      ensVerified = await reverifyName(parsed.target.name, heliosRpc, phase1EnsChunks)
+      ensVerified = await reverifyNameFast(parsed.target.name, heliosRpc, phase1EnsChunks)
       w3log('[w3] Mode 1 — ENS/GNS re-verification result:', ensVerified)
     }
 
@@ -926,10 +1126,15 @@ async function twoPhaseResolve(
       },
     }
   } catch (err) {
+    if (pageGone()) {
+      w3log('[w3] Mode 1 — discarded: page closed or superseded by a newer navigation')
+      port.disconnect()
+      return
+    }
     console.warn('[w3] Mode 1 — Recent block, Helios-verified: failed —', (err as Error).message)
     if (!heliosRpc) heliosFailure = (err as Error).message
 
-    if (isEip2935Error(err) && chain.consensusRpcs.length > 0) {
+    if (isEip2935Error(err) && !aheadOfHead(err) && chain.consensusRpcs.length > 0) {
       w3log('[w3] Mode 1 failed (EIP-2935, block outside Helios\'s ring) — falling back to Mode 2 — Historical block, beacon-verified')
       try {
         const beacon = await verifyViaBeacon(
@@ -966,7 +1171,7 @@ async function twoPhaseResolve(
         }
         // heliosRpc synced but threw EIP-2935 on block lookup; ENS uses 'latest' so it works
         if (heliosRpc?.isHeliosBacked() && parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
-          ensVerified = await reverifyName(parsed.target.name, heliosRpc, phase1EnsChunks)
+          ensVerified = await reverifyNameFast(parsed.target.name, heliosRpc, phase1EnsChunks)
           w3log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
         }
         update = {
@@ -1137,6 +1342,9 @@ async function resolveContractServed(
       update = contractUpdate(rawUrl, address, content, blockNumber, blockHash,
         { heliosBacked: false, trieVerified: false, verified: true, localMode: true })
     } else {
+      // Not before the checkpoint Helios started from is confirmed.
+      await waitForConfirmedCheckpoint(chain, isSuperseded)
+      if (isSuperseded()) { port.disconnect(); return }
       // Verify through Helios, byte-comparing the served body. The base Helios instance
       // can be evicted/restarted mid-call by the OOS-wedge machinery (155s-behind stale
       // consensus is common here) — that surfaces as "Provider has been shut down". Retry
@@ -1149,20 +1357,62 @@ async function resolveContractServed(
       // state change) it may not see the contract / the new state yet. Both resolve by waiting a little,
       // so retry those a few times before treating them as unverified / a mismatch.
       let behindRetries = 0
-      // A Helios instance that cannot sync (head frozen, lag growing) is restarted by the OOS watchdog once it is
-      // ~150s behind, and the fresh one then needs a little while to come up. Wait that out by time, not by a
-      // fixed number of tries: giving up earlier reported "unverified" a few seconds before recovery began.
-      const heliosDeadline = Date.now() + 180_000
-      for (let attempt = 0; Date.now() < heliosDeadline; attempt++) {
+      let finalizedSettled = false
+      // Helios that can't start yet, or whose head hasn't reached the deployment, is waited for as long as the page is
+      // open (the viewer shows for how long). A restart by the OOS watchdog lands the next attempt on the new instance.
+      // It only gives up once Helios's head HAS reached the block and the content still differs / is still missing.
+      const heliosWaitStart = Date.now()
+      const progress = (detail: string) => send({ type: 'verification-progress', since: heliosWaitStart, detail })
+      // Helios's verified head when it is still below the block the page was read at (-1: not known yet, e.g. a cold
+      // start refusing 'latest'), or null when it has reached it.
+      const headBelowBlock = async (rpc: IVerifiedRpc): Promise<number | null> => {
+        try {
+          const head = Number(await rpc.request<string>('eth_blockNumber', [], true))
+          return head < blockNumber ? head : null
+        } catch { return -1 }
+      }
+      const waitForHead = async (rpc: IVerifiedRpc, what: string): Promise<boolean> => {
+        const head = await headBelowBlock(rpc)
+        if (head === null) return false
+        progress(`${what}: Helios's verified head (${head < 0 ? 'still syncing' : `block ${head}`}) has not reached block ${blockNumber} yet`)
+        await new Promise(r => setTimeout(r, 6_000))
+        return true
+      }
+      for (let attempt = 0; ; attempt++) {
+        if (isSuperseded()) break
+        let initErr: string | undefined
         const heliosRpc = await Promise.race([
-          getOrCreateRpc(chain),
+          getOrCreateRpc(chain).catch((e: unknown) => { initErr = (e as Error).message; return undefined }),
           new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
-        ]).catch(() => undefined)
-        if (!heliosRpc) { lastErr = new Error('Helios not available (35s timeout — still syncing or consensus RPC unreachable)'); break }
+        ])
+        if (!heliosRpc) {
+          lastErr = new Error(initErr ? `Helios init failed — ${initErr}` : 'Helios still syncing (consensus RPC slow or unreachable)')
+          if (initErr && /not a Helios-supported network/.test(initErr)) break
+          progress((lastErr as Error).message)
+          await new Promise(r => setTimeout(r, 10_000))   // a failed start is held for 60s (getOrCreateRpc), then retried
+          continue
+        }
+        try { await assertShownCheckpoint(chain, heliosRpc) } catch (e) { lastErr = e; break }
+        // First try the finalized block: a cold Helios answers there at once, while 'latest' stays refused until its
+        // head catches up (minutes, see oos-probe.ts). Same bytes there means the page on screen is what Helios proved.
+        if (!finalizedSettled) {
+          const fin = await checkAtFinalized(heliosRpc, address, parsed.path, content.body)
+          if (fin.status === 'match') {
+            verified = fin.content
+            heliosBackedFlag = heliosRpc.isHeliosBacked()
+            w3log('[w3] Contract-served — Helios-verified at the finalized block ✓ (no wait for its head)')
+            break
+          }
+          if (fin.status === 'different') finalizedSettled = true   // decided by the 'latest' comparison below
+        }
         try {
           verified = await fetchContractContent(heliosRpc, address, parsed.path, 'latest')
           heliosBackedFlag = heliosRpc.isHeliosBacked()
-          if (bytesEqual(verified.body, content.body) || behindRetries >= 3) break
+          if (bytesEqual(verified.body, content.body)) break
+          // Differs: fine to wait while Helios's head is still below the block the page was read at; once it is
+          // there, keep a few short retries for a head that trails by a block, then report the mismatch.
+          if (await waitForHead(heliosRpc, 'Content differs')) continue
+          if (behindRetries >= 3) break
           behindRetries++
           w3log(`[w3] Contract-served — Helios differs from the plain read; waiting for its head to catch up (${behindRetries}/3)`)
           await new Promise(r => setTimeout(r, 5000))
@@ -1173,12 +1423,15 @@ async function resolveContractServed(
           // The plain read found the contract, so "not a web3:// site" from Helios means its head hasn't
           // reached the deployment block yet.
           const notYetVisible = m.includes('does not implement') || m.includes('is not a web3://')
+          if (notYetVisible && await waitForHead(heliosRpc, 'Contract not visible to Helios yet')) continue
           if (!transient && !(notYetVisible && behindRetries < 6)) throw e
           if (notYetVisible) behindRetries++
+          if (transient) progress(m.includes('out of sync') ? "Helios's head is still catching up" : 'Helios is restarting')
           console.warn(`[w3] Contract-served — Helios ${transient ? 'instance restarted' : 'head behind the deployment'} (attempt ${attempt + 1}) — retrying`)
           await new Promise(r => setTimeout(r, !transient ? 5000 : m.includes('out of sync') ? 3000 : 1500))
         }
       }
+      if (isSuperseded()) { port.disconnect(); return }
       if (!verified) throw lastErr ?? new Error('Helios verification failed')
 
       const match = bytesEqual(verified.body, content.body)
@@ -1308,6 +1561,50 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === 'broadcast-raw-tx') {
     broadcastRawTx(msg.chainId, msg.rawTx, msg.endpoint ?? null).then(sendResponse)
+    return true
+  }
+  // Settings → "Remove checkpoint": forget the pinned checkpoint and its check, and restart Helios for that chain so
+  // it syncs again from a fresh root right away (the next page also would).
+  if (msg.type === 'reset-checkpoint' && msg.chainId) {
+    chrome.storage.sync.get('chains').then(async (stored) => {
+      const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
+      const chain = chains[msg.chainId]
+      const network = chain ? heliosNetworkFor(chain) : undefined
+      const keys = [checkpointInfoKey(msg.chainId), ...(network ? [pinnedCheckpointKey(network)] : [])]
+      await chrome.storage.local.remove(keys).catch(() => {})
+      evictChainRpc(msg.chainId)
+      freshRpcCache.delete(msg.chainId)
+      freshRpcReady.delete(msg.chainId)
+      w3log(`[w3] Checkpoint for chain ${msg.chainId} removed — Helios restarts from a fresh root`)
+      if (chain && !chain.localMode) getOrCreateRpc(chain)
+      sendResponse({ ok: true })
+    }).catch(() => sendResponse({ ok: false }))
+    return true
+  }
+  // Viewer → checkpoint dialog: the user picked the checkpoint they trust. The one in use → just confirm it.
+  // Another one → pin it (marked as the user's choice), restart Helios from it, and the new check keeps the mark.
+  if (msg.type === 'choose-checkpoint' && msg.chainId && typeof msg.root === 'string' && /^0x[0-9a-fA-F]{64}$/.test(msg.root)) {
+    chrome.storage.sync.get('chains').then(async (stored) => {
+      const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
+      const chain = chains[msg.chainId]
+      const network = chain ? heliosNetworkFor(chain) : undefined
+      if (!chain || !network) { sendResponse({ ok: false }); return }
+      const key = checkpointInfoKey(msg.chainId)
+      const info = (await chrome.storage.local.get(key))[key] as CheckpointInfo | undefined
+      if (info?.root?.toLowerCase() === msg.root.toLowerCase()) {
+        await chrome.storage.local.set({ [key]: { ...info, userCheckedAt: Date.now() } })
+        sendResponse({ ok: true, restarted: false })
+        return
+      }
+      await chrome.storage.local.set({ [pinnedCheckpointKey(network)]: { root: msg.root, adoptedAt: Date.now(), userChosen: true } satisfies PinnedCheckpoint })
+      await chrome.storage.local.remove(key)
+      evictChainRpc(msg.chainId)
+      freshRpcCache.delete(msg.chainId)
+      freshRpcReady.delete(msg.chainId)
+      w3log(`[w3] Checkpoint ${msg.root} chosen by the user for chain ${msg.chainId} — Helios restarts from it`)
+      if (!chain.localMode) getOrCreateRpc(chain)
+      sendResponse({ ok: true, restarted: true })
+    }).catch(() => sendResponse({ ok: false }))
     return true
   }
   if (msg.type === 'warmup-helios' && msg.chainId) {

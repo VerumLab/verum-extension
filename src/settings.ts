@@ -1,3 +1,5 @@
+import { copyButton, selectable, selectingText } from './lib/ui/copy-button.js'
+import { checkpointInfoKey, checkpointSummary, checkpointSourceRows, checkpointRecheckText, checkpointCheckState, markCheckpointChecked, CHECK_HINT, type CheckpointInfo } from './lib/verify/checkpoint-info.js'
 import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
 import type { ChainConfig, EraSource, StateSource, ForceMode, HistSource } from './types.js'
 
@@ -248,6 +250,10 @@ function buildCard(chain: ChainConfig): HTMLElement {
         Local node mode <span class="rpc-hint">(only activate when using trusted local execution and consensus nodes)</span>
       </label>
     </div>
+    <div class="rpc-group cp-group">
+      <div class="rpc-label">Light-client checkpoint</div>
+      <div class="cp-status" data-cp-chain="${chain.chainId}"></div>
+    </div>
     <div class="rpc-group">
       <div class="rpc-label">Consensus RPCs (beacon API)</div>
       <div class="consensus-list"></div>
@@ -278,6 +284,8 @@ function buildCard(chain: ChainConfig): HTMLElement {
       <input class="portal-rpc" type="url" value="${chain.portalRpc ?? ''}" placeholder="http://localhost:8545" />
     </div>
   `
+
+  void fillCheckpoint(card.querySelector('.cp-status') as HTMLDivElement, chain.chainId)
 
   const consensusList  = card.querySelector('.consensus-list')  as HTMLDivElement
   const executionList  = card.querySelector('.execution-list')  as HTMLDivElement
@@ -407,6 +415,114 @@ function buildCard(chain: ChainConfig): HTMLElement {
 
   return card
 }
+
+// Light-client checkpoint for a chain: the full hash Helios started from, when, and which sources agree.
+async function fillCheckpoint(el: HTMLDivElement, chainId: number) {
+  const key = checkpointInfoKey(chainId)
+  const info = (await chrome.storage.local.get(key).catch(() => ({})) as Record<string, unknown>)[key] as CheckpointInfo | undefined
+  renderCheckpointStatus(el, info)
+}
+
+// Chains whose checkpoint details are unfolded; kept so a re-render (a new check result) doesn't close them.
+const openCheckpoints = new Set<number>()
+
+function renderCheckpointStatus(el: HTMLElement, info: CheckpointInfo | undefined) {
+  const line = (text: string, cls: string) => { const d = document.createElement('div'); d.className = cls; d.textContent = text; return d }
+  if (!info?.root) {
+    el.replaceChildren(line(checkpointSummary(info), 'cp-line'))
+    return
+  }
+  const chainId = info.chainId
+  const kids: HTMLElement[] = []
+
+  // The hash is the toggle (like the popup): blue until checked, green after.
+  // Selectable (to copy or compare by hand), with a Copy button; a plain click opens the details.
+  const state = checkpointCheckState(info)
+  const hash = document.createElement('span')
+  hash.setAttribute('role', 'button')
+  hash.tabIndex = 0
+  hash.className = state !== 'needs-check' ? 'cp-root cp-ok' : 'cp-root'
+  hash.textContent = info.root
+  hash.title = 'Click for the epoch and which sources agree'
+  const hashRow = document.createElement('div')
+  hashRow.className = 'cp-hashrow'
+  hashRow.append(hash, copyButton(info.root, 'checkpoint hash'))
+  kids.push(hashRow)
+
+  const ask = document.createElement('div')
+  ask.className = 'cp-ask'
+  ask.title = CHECK_HINT
+  if (state === 'user-checked') {   // confirmed by the sources: no line (the agreement row says enough)
+    const countdown = line(checkpointRecheckText(info), 'cp-line cp-recheck')
+    const timer = setInterval(() => {
+      if (!countdown.isConnected) { clearInterval(timer); return }   // the card was re-rendered
+      countdown.textContent = checkpointRecheckText(info)
+    }, 1000)
+    ask.append(countdown)
+  } else if (state === 'needs-check') {
+    ask.append(line('Check this hash against a source you trust', 'cp-todo'))
+    const btn = document.createElement('button')
+    btn.textContent = 'I checked it'
+    btn.className = 'cp-confirm'
+    const root = info.root
+    btn.addEventListener('click', () => { void markCheckpointChecked(chainId, root) })
+    ask.append(btn)
+  }
+  if (ask.childElementCount) kids.push(ask)   // empty when the sources confirmed it
+
+  // Details: slot/epoch/start time, the agreement summary and one row per source.
+  const drop = document.createElement('div')
+  drop.className = 'cp-drop'
+  if (!openCheckpoints.has(chainId)) drop.classList.add('hidden')
+  if (info.slot != null) {
+    const at = document.createElement('div')
+    at.className = 'cp-line'
+    at.append('Slot ', selectable(String(info.slot)), copyButton(String(info.slot), 'slot'),
+      ' · epoch ', selectable(String(info.epoch)), copyButton(String(info.epoch), 'epoch'),
+      ` · Helios started ${new Date(info.startedAt).toLocaleTimeString()}`)
+    drop.append(at)
+  }
+  drop.append(line(checkpointSummary(info), info.verdict === 'disagree' ? 'cp-line cp-bad' : info.verdict === 'agree' ? 'cp-line cp-ok' : 'cp-line'))
+  for (const r of checkpointSourceRows(info)) {
+    const row = document.createElement('div')
+    row.className = r.status === 'mismatch' ? 'cp-src cp-bad' : 'cp-src'
+    row.append(line(r.left, 'cp-src-who'), line(r.right, 'cp-src-what'))
+    drop.append(row)
+  }
+  // Forget this checkpoint: Helios restarts and adopts (and asks to check) a fresh one.
+  const reset = document.createElement('button')
+  reset.type = 'button'
+  reset.className = 'cp-reset'
+  reset.textContent = 'Remove checkpoint'
+  reset.title = 'Forget this checkpoint and restart the light client from a fresh one'
+  reset.addEventListener('click', () => {
+    reset.disabled = true
+    reset.textContent = 'Removing…'
+    chrome.runtime.sendMessage({ type: 'reset-checkpoint', chainId })
+      .catch(() => {})
+      .finally(() => { el.replaceChildren(line('Checkpoint removed — the light client is syncing from a fresh one…', 'cp-line')) })
+  })
+  drop.append(reset)
+  kids.push(drop)
+
+  hash.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); hash.click() } })
+  hash.addEventListener('click', () => {
+    if (selectingText()) return   // selecting the hash to copy it, not opening the details
+    const open = drop.classList.toggle('hidden') === false
+    if (open) openCheckpoints.add(chainId); else openCheckpoints.delete(chainId)
+  })
+  el.replaceChildren(...kids)
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return
+  for (const [key, change] of Object.entries(changes)) {
+    const m = /^checkpoint_info_(\d+)$/.exec(key)
+    if (!m) continue
+    const el = document.querySelector<HTMLElement>(`.cp-status[data-cp-chain="${m[1]}"]`)
+    if (el) renderCheckpointStatus(el, change.newValue as CheckpointInfo | undefined)
+  }
+})
 
 function rpcRow(url: string): HTMLElement {
   const row = document.createElement('div')

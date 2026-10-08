@@ -3,7 +3,7 @@
 :root {
   --bg: #0d1117; --surface: #161b22; --border: #30363d;
   --text: #c9d1d9; --text-muted: #8b949e;
-  --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+  --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --orange: #f0883e; --red: #f85149;
   --radius: 8px;
 }
 
@@ -87,6 +87,8 @@ button.secondary:hover { border-color: var(--accent); color: var(--accent); }
 #summary td { padding: 5px 10px; border-bottom: 1px solid var(--border); font-size: 12px; }
 #summary td:first-child { color: var(--text-muted); width: 130px; white-space: nowrap; }
 #summary td:last-child { font-family: monospace; word-break: break-all; }
+#summary .cost-cell { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+#summary .cost-warn { color: var(--orange); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 11px; word-break: normal; text-align: right; }
 
 #preview-host {
   position: relative; height: 480px;

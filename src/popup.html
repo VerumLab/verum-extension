@@ -18,6 +18,20 @@
     <div id="verdict">
       <span id="verdict-icon"></span>
       <span id="verdict-text"></span>
+      <!-- Light-client checkpoint Helios started from: the hash, and on click its epoch and how many sources agree -->
+      <div id="verdict-checkpoint" class="hidden">
+        <div id="cp-hashrow">
+          <span id="cp-hash" role="button" tabindex="0" title="Checkpoint Helios started from — click for details"></span>
+        </div>
+        <div id="cp-ask">
+          <span id="cp-ask-text"></span>
+          <button id="cp-confirm" type="button">I checked it</button>
+        </div>
+        <div id="cp-drop" class="hidden">
+          <div id="cp-epoch"></div>
+          <div id="cp-agree"></div>
+        </div>
+      </div>
     </div>
     <table id="proof-table">
       <tbody>

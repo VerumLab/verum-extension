@@ -73,8 +73,10 @@ export async function fetchEraBlockRootsFromParquet(
   const eraStartSlot = era * 8192
   const eraEndSlot   = eraStartSlot + 8191
   const defaultBase  = network ? `${XATU_BASE}/${network}/databases/default/canonical_beacon_block` : null
+  // Settings are the only source once a chain has been saved there: the built-in base is used only when the chain
+  // has no parquet list at all (never saved), not added on top of the user's own list.
   const bases        = customParquetUrls !== undefined
-    ? [...customParquetUrls, ...(defaultBase ? [defaultBase] : [])]
+    ? customParquetUrls
     : (defaultBase ? [defaultBase] : [])
 
   const slotSet = new Set<number>()

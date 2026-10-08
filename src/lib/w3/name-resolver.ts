@@ -8,6 +8,7 @@
 
 import { keccak256, concat, getBytes, toUtf8Bytes, hexlify, type BytesLike } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
+import { atBlockTag } from '../rpc/at-block-tag.js'
 
 // Same address on mainnet and Sepolia
 const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e'
@@ -189,6 +190,16 @@ export function compareEnsChunks(heliosChunks: TxRef[], phase1Chunks: TxRef[]): 
 
 // Re-resolve a name through Helios and compare it to the phase-1 chunks, retrying on a
 // transient failure. 
+// Name re-verification that does not wait for Helios's head. Helios can read the name at the finalized block right
+// after a cold start (calls at 'latest' are refused while its head is stale). If that finalized record equals what
+// the plain RPC gave in phase 1, the name is confirmed; if not (the record changed in the last ~13 minutes, or Helios
+// is unavailable) it is settled by the ordinary check at 'latest'.
+export async function reverifyNameFast(name: string, rpc: IVerifiedRpc, phase1Chunks: TxRef[]): Promise<boolean | undefined> {
+  const atFinalized = await reverifyName(name, atBlockTag(rpc, 'finalized'), phase1Chunks, 1, 0, 0)
+  if (atFinalized === true) return true
+  return reverifyName(name, rpc, phase1Chunks)
+}
+
 // Helios (or the RPC) could not run the call at all. This must never be reported as "the name has no record":
 // that is a statement about the chain, and nothing was read.
 const isInfraError = (e: unknown) => /out of sync|shut down|wasm call timeout|not available/i.test((e as Error)?.message ?? '')
@@ -199,7 +210,7 @@ export async function reverifyName(
   phase1Chunks: TxRef[],
   attempts = 4,
   delayMs = 1500,
-  heliosWaitMs = 180_000,
+  heliosWaitMs = 360_000,
 ): Promise<boolean | undefined> {
   // A freshly started Helios is typically 1-2 minutes behind and needs a while to catch up (or for its watchdog
   // to restart it). That is "not ready yet", not a failed check, so keep asking until it answers or the budget
